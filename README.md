@@ -41,8 +41,10 @@ HLX is a **deterministic, reversible, content-addressed programming language** d
 2. **Vulkan Phase 2** (1,500 lines, 98.5% passing) - GPU compute backend
 3. **Tier 1 Tools** - Production CLI tools (shader-compiler, pipeline-cli, demo-cube)
 4. **Tier 2 Tools** - Complete demonstrations (compute-particles, nbody, raytrace-lab)
-5. **HLXL Frontend** - UI language compiled to interactive browser components (2-second hot reload)
-6. **Teaching Corpus** - Complete reference for teaching HLX to AI systems
+5. **Model Compiler** - Convert ONNX/TFLite → deterministic HLX contracts (CONTRACT_910)
+6. **Image Classification** - Real-world ML inference example using Model Compiler
+7. **HLXL Frontend** - UI language compiled to interactive browser components (2-second hot reload)
+8. **Teaching Corpus** - Complete reference for teaching HLX to AI systems
 
 All delivered with mathematical guarantees: axioms verified, invariants enforced, tests passing.
 
