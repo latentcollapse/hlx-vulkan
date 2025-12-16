@@ -12,11 +12,6 @@ Built using parallel Claude + Gemini orchestration.
 
 ## The Research
 
-**Cost Analysis:**
-- Traditional equivalent: $150-200 in API costs
-- HLX implementation: $50 (Gemini) + $50 (Claude) = **$100 total**
-- **Savings: 84% cost reduction** ✅ Independently verified by two frontier models
-
 **Axiom Verification (28/28 tests passing):**
 - ✅ A1 (DETERMINISM): Same inputs → identical outputs
 - ✅ A2 (REVERSIBILITY): decode(encode(x)) = x
