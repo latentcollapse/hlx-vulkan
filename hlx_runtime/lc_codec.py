@@ -87,6 +87,11 @@ def decode_sleb128(data: bytes, offset: int = 0) -> Tuple[int, int]:
             if shift < 64 and (byte & 0x40):
                 result |= -(1 << shift)
             break
+    else:
+        # Loop exited because no more data (not because of break)
+        # This means the last byte had the continuation bit set
+        if size > 0 and (data[offset + size - 1] & 0x80) != 0:
+            raise LCDecodeError(f"Incomplete SLEB128 at offset {offset}: continuation bit set but no following byte")
     return result, size
 
 
@@ -159,7 +164,15 @@ class LCBinaryEncoder:
             self.buffer.append(LC_TAGS['ARR_END'])
         elif isinstance(value, dict):
             self.buffer.append(LC_TAGS['OBJ_START'])
-            sorted_keys = sorted(value.keys())
+            # INV-003: Sort keys with special handling for @N numeric fields
+            # @0, @1, @2, @10 should sort numerically, not lexicographically
+            def sort_key(k):
+                if k.startswith('@') and k[1:].isdigit():
+                    return (0, int(k[1:]))  # Numeric fields sort first, by number
+                else:
+                    return (1, k)  # Non-numeric fields sort second, lexicographically
+
+            sorted_keys = sorted(value.keys(), key=sort_key)
             self.buffer.extend(encode_uleb128(len(sorted_keys)))
             for key in sorted_keys:
                 if not isinstance(key, str):
@@ -245,11 +258,18 @@ class LCBinaryDecoder:
             for _ in range(count):
                 key_length = self._read_uleb128()
                 key = self._read_bytes(key_length).decode('utf-8')
-                if prev_key is not None and key <= prev_key:
-                    if key == prev_key:
-                        raise LCDecodeError(f"{E_FIELD_ORDER}: Duplicate key {key}")
-                    else:
-                        raise LCDecodeError(f"{E_FIELD_ORDER}: Keys not sorted: {prev_key} >= {key}")
+                if prev_key is not None:
+                    # INV-003: Keys must be sorted with numeric handling for @N fields
+                    def sort_val(k):
+                        if k.startswith('@') and k[1:].isdigit():
+                            return (0, int(k[1:]))
+                        else:
+                            return (1, k)
+                    if sort_val(key) <= sort_val(prev_key):
+                        if key == prev_key:
+                            raise LCDecodeError(f"{E_FIELD_ORDER}: Duplicate key {key}")
+                        else:
+                            raise LCDecodeError(f"{E_FIELD_ORDER}: Keys not sorted: {prev_key} >= {key}")
                 prev_key = key
                 result[key] = self._decode_value(depth + 1)
             if self._read_byte() != LC_TAGS['OBJ_END']:
@@ -268,24 +288,18 @@ class LCTParser:
         text = text.strip()
         if not text.startswith('[') or not text.endswith(']'):
             raise LCDecodeError("LC-T text must be enclosed in brackets []")
-        
+
         content = text[1:-1]
         self.tokens = self._tokenize(content)
         self.idx = 0
-        
-        # The stream represents a single value if it's a primitive or container
-        # Note: The format [TAG, ...] suggests the content IS the stream.
-        # But for primitives, it might be [INT(123)].
-        # For objects: [OBJ_START, ... OBJ_END]
-        
-        # We need to parse exactly one value from the stream.
-        # If there are leftovers, it might be an issue, but for now we parse one value.
+
+        # Parse exactly one value from the stream
         value = self._parse_from_tokens()
+
+        # Verify all tokens were consumed (INV-003 equivalent for text)
         if self.idx < len(self.tokens):
-             # Check if we have trailing data? 
-             # For pedagogical format, maybe it allows streaming?
-             # But canonical parse should probably consume all.
-             pass
+            raise LCDecodeError(f"Unexpected trailing tokens: {self.tokens[self.idx:]}")
+
         return value
 
     def _tokenize(self, text: str) -> List[str]:
@@ -318,18 +332,21 @@ class LCTParser:
     def _parse_from_tokens(self) -> Any:
         if self.idx >= len(self.tokens):
             raise LCDecodeError("Unexpected end of token stream")
-            
+
         token = self.tokens[self.idx]
         self.idx += 1
-        
+
         if token == 'NULL': return None
         if token == 'TRUE': return True
         if token == 'FALSE': return False
-        
+
         if token.startswith('INT(') and token.endswith(')'):
             return int(token[4:-1])
         if token.startswith('FLOAT(') and token.endswith(')'):
-            return float(token[6:-1])
+            val = float(token[6:-1])
+            if math.isnan(val) or math.isinf(val):
+                raise LCDecodeError(f"{E_FLOAT_SPECIAL}: NaN/Inf not allowed in LC-T")
+            return val
         if token.startswith('STRING(') and token.endswith(')'):
             content = token[7:-1]
             if content.startswith('"') and content.endswith('"'):
@@ -443,6 +460,8 @@ def encode_runic(value: Any) -> str:
     elif isinstance(value, int):
         return f"{RUNIC_GLYPHS['INT']}{value}"
     elif isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise LCEncodeError(f"{E_FLOAT_SPECIAL}: NaN/Inf not allowed in runic encoding")
         return f"{RUNIC_GLYPHS['FLOAT']}{value}"
     elif isinstance(value, str):
         if value.startswith('&h_'):
