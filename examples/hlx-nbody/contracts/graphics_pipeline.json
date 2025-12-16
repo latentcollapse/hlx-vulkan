@@ -1,0 +1,54 @@
+{
+  "902": {
+    "@0": "PIPELINE_CONFIG",
+    "@1": "nbody_graphics_pipeline",
+    "@2": "graphics",
+    "@3": [
+      {
+        "@0": 0,
+        "@1": "&h_shader_sphere_vert",
+        "@2": "VERTEX_SHADER"
+      },
+      {
+        "@0": 1,
+        "@1": "&h_shader_sphere_frag",
+        "@2": "FRAGMENT_SHADER"
+      }
+    ],
+    "@4": {
+      "@0": "TRIANGLE_LIST",
+      "@1": {
+        "@0": 0,
+        "@1": "FLOAT",
+        "@2": 3
+      }
+    },
+    "@5": {
+      "@0": "enable_depth_test",
+      "@1": true,
+      "@2": "LESS"
+    },
+    "@6": [
+      {
+        "@0": 0,
+        "@1": "UNIFORM_BUFFER",
+        "@2": "NBodyMatrices"
+      },
+      {
+        "@0": 1,
+        "@1": "UNIFORM_BUFFER",
+        "@2": "LightingParams"
+      },
+      {
+        "@0": 2,
+        "@1": "STORAGE_BUFFER",
+        "@2": "BodyData"
+      }
+    ],
+    "@7": {
+      "@0": "2025-12-16T00:00:00Z",
+      "@1": "deterministic",
+      "@2": true
+    }
+  }
+}

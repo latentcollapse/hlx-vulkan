@@ -1,0 +1,91 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+// HLX Ray Tracing Lab - Raygen Shader
+// ====================================
+// Generates primary rays from camera
+// Demonstrates deterministic ray generation for HLX verification
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba8) uniform image2D image;
+
+layout(binding = 2, set = 0) uniform CameraParams {
+    mat4 view;
+    mat4 projection;
+    vec4 eye_position;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    vec2 film_size;
+    float focal_length;
+} camera;
+
+layout(location = 0) rayPayloadEXT vec3 payload;
+
+// Pseudorandom number generator (deterministic seed-based)
+// For axiom A1 DETERMINISM: same camera + seed = same sequence
+uint seed = 0x12345678;
+
+uint pcg_hash() {
+    uint state = seed;
+    seed = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float() {
+    return float(pcg_hash()) / float(0xffffffffu);
+}
+
+void main() {
+    // Get image dimensions
+    ivec2 pixel_coord = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 image_size = imageSize(image);
+
+    // Normalize coordinates to [-1, 1]
+    vec2 uv = vec2(pixel_coord) / vec2(image_size);
+
+    // Create ray origin from camera
+    vec3 origin = camera.eye_position.xyz;
+
+    // Create ray direction via perspective projection
+    vec3 cam_right = camera.right.xyz;
+    vec3 cam_up = camera.up.xyz;
+    vec3 cam_forward = camera.forward.xyz;
+
+    // Compute ray direction
+    vec2 ndc = (uv - 0.5) * 2.0;
+    ndc.y = -ndc.y;  // Flip Y for standard conventions
+
+    vec3 direction = normalize(
+        cam_forward * camera.focal_length +
+        cam_right * ndc.x +
+        cam_up * ndc.y
+    );
+
+    // Initialize ray payload (accumulator)
+    payload = vec3(0.0);
+
+    // Trace primary ray
+    // Ray flags: opaque, skip procedural geometry, terminate on first hit
+    uint ray_flags = gl_RayFlagsOpaqueEXT;
+    float min_distance = 0.001;
+    float max_distance = 10000.0;
+
+    traceRayEXT(
+        topLevelAS,        // acceleration structure
+        ray_flags,         // ray flags
+        0xFF,              // cullMask (trace all instances)
+        0,                 // sbtRecordOffset (raygen index)
+        0,                 // sbtRecordStride (raygen stride)
+        0,                 // missIndex
+        origin,            // ray origin
+        min_distance,      // min distance
+        direction,         // ray direction
+        max_distance,      // max distance
+        0                  // payload location
+    );
+
+    // Store result in image
+    imageStore(image, pixel_coord, vec4(payload, 1.0));
+}

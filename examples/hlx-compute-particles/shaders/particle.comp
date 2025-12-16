@@ -1,0 +1,56 @@
+#version 450
+
+// Particle compute shader - Sascha Willems compute particles demo port
+// HLX compute kernel CONTRACT_901
+// GPU-side particle physics: position += velocity, apply forces
+
+layout(binding = 0, std430) buffer ParticleBuffer {
+    vec4 particles[];  // xyz = position, w = lifetime
+} particleBuffer;
+
+layout(binding = 1, std430) buffer VelocityBuffer {
+    vec4 velocities[];  // xyz = velocity, w = speed
+} velocityBuffer;
+
+layout(binding = 2) uniform ParticleParams {
+    float deltaTime;
+    float gravity;
+    int particleCount;
+    float damping;
+} params;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= params.particleCount) {
+        return;
+    }
+
+    // Load particle and velocity
+    vec4 pos = particleBuffer.particles[idx];
+    vec4 vel = velocityBuffer.velocities[idx];
+
+    // Skip dead particles
+    if (pos.w <= 0.0) {
+        return;
+    }
+
+    // Apply physics
+    // Gravity acceleration (downward)
+    vel.xyz += vec3(0.0, -params.gravity, 0.0) * params.deltaTime;
+
+    // Damping (energy loss)
+    vel.xyz *= params.damping;
+
+    // Update position
+    pos.xyz += vel.xyz * params.deltaTime;
+
+    // Decrease lifetime
+    pos.w -= params.deltaTime;
+
+    // Store updated values
+    particleBuffer.particles[idx] = pos;
+    velocityBuffer.velocities[idx] = vel;
+}

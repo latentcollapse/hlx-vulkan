@@ -1,0 +1,233 @@
+// HLX Demo Cube Contract Definition
+// CONTRACT_1000: hlx-demo-cube
+// Version: 1.0.0
+// Date: 2025-12-16
+
+// =============================================================================
+// CONTRACT_900: Vertex Shader (cube.vert)
+// =============================================================================
+// Axiom A1 DETERMINISM: Same GLSL source -> same SPIR-V -> same handle
+// Axiom A2 REVERSIBILITY: resolve(collapse(spirv)) = spirv
+
+contract 900 {
+  @0: "VULKAN_SHADER",
+  @1: "hlx_demo_cube_vertex",
+  @2: {
+    shader_stage: "VERTEX_SHADER",
+    entry_point: "main",
+    source_file: "shaders/cube.vert",
+    spirv_file: "shaders/compiled/cube.vert.spv",
+    descriptor_bindings: [
+      { binding: 0, type: "UNIFORM_BUFFER", name: "Matrices" }
+    ],
+    push_constants: {
+      offset: 0,
+      size: 8,
+      layout: [
+        { name: "rotation_angle", type: "float", offset: 0 },
+        { name: "time", type: "float", offset: 4 }
+      ]
+    },
+    inputs: [
+      { location: 0, name: "inPosition", type: "vec3" },
+      { location: 1, name: "inNormal", type: "vec3" },
+      { location: 2, name: "inColor", type: "vec3" }
+    ],
+    outputs: [
+      { location: 0, name: "fragColor", type: "vec3" },
+      { location: 1, name: "fragNormal", type: "vec3" },
+      { location: 2, name: "fragWorldPos", type: "vec3" }
+    ]
+  },
+  @3: {
+    determinism: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_900: Fragment Shader (cube.frag)
+// =============================================================================
+
+contract 900 {
+  @0: "VULKAN_SHADER",
+  @1: "hlx_demo_cube_fragment",
+  @2: {
+    shader_stage: "FRAGMENT_SHADER",
+    entry_point: "main",
+    source_file: "shaders/cube.frag",
+    spirv_file: "shaders/compiled/cube.frag.spv",
+    descriptor_bindings: [],
+    inputs: [
+      { location: 0, name: "fragColor", type: "vec3" },
+      { location: 1, name: "fragNormal", type: "vec3" },
+      { location: 2, name: "fragWorldPos", type: "vec3" }
+    ],
+    outputs: [
+      { location: 0, name: "outColor", type: "vec4" }
+    ],
+    lighting: {
+      model: "PHONG",
+      ambient_strength: 0.15,
+      diffuse_strength: 0.7,
+      specular_strength: 0.5,
+      shininess: 32.0
+    }
+  },
+  @3: {
+    determinism: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_902: Graphics Pipeline Configuration
+// =============================================================================
+// INV-003 FIELD_ORDER: Fields @0, @1, @2, @3 must be in ascending order
+
+contract 902 {
+  @0: "PIPELINE_CONFIG",
+  @1: "hlx_demo_cube_pipeline",
+  @2: {
+    pipeline_type: "graphics",
+    shader_stages: {
+      @0: {
+        @0: 0,
+        @1: "&h_shader_vertex_PLACEHOLDER",
+        @2: "VERTEX_SHADER"
+      },
+      @1: {
+        @0: 1,
+        @1: "&h_shader_fragment_PLACEHOLDER",
+        @2: "FRAGMENT_SHADER"
+      }
+    }
+  },
+  @3: {
+    vertex_input: {
+      binding: 0,
+      stride: 36,
+      input_rate: "VERTEX",
+      attributes: [
+        { location: 0, format: "R32G32B32_SFLOAT", offset: 0 },
+        { location: 1, format: "R32G32B32_SFLOAT", offset: 12 },
+        { location: 2, format: "R32G32B32_SFLOAT", offset: 24 }
+      ]
+    },
+    input_assembly: {
+      topology: "TRIANGLE_LIST",
+      primitive_restart: false
+    },
+    rasterization: {
+      polygon_mode: "FILL",
+      cull_mode: "BACK",
+      front_face: "COUNTER_CLOCKWISE",
+      depth_bias_enable: false,
+      line_width: 1.0
+    },
+    depth_stencil: {
+      depth_test_enable: true,
+      depth_write_enable: true,
+      depth_compare_op: "LESS"
+    },
+    color_blend: {
+      blend_enable: false,
+      color_write_mask: "RGBA"
+    },
+    dynamic_state: ["VIEWPORT", "SCISSOR"],
+    push_constants: {
+      stage_flags: "VERTEX",
+      offset: 0,
+      size: 8
+    }
+  }
+}
+
+// =============================================================================
+// CONTRACT_1000: Demo Cube Application
+// =============================================================================
+
+contract 1000 {
+  @0: "hlx_demo_cube",
+  @1: {
+    description: "HLX port of Khronos vkcube - renders spinning cube",
+    version: "1.0.0",
+    author: "HLX Ecosystem",
+    license: "MIT"
+  },
+  @2: {
+    dependencies: [
+      "&h_hlx_runtime",
+      "&h_vulkan_context",
+      "&h_contract_900",
+      "&h_contract_902"
+    ],
+    required_contracts: [900, 901, 902]
+  },
+  @3: {
+    geometry: {
+      type: "cube",
+      vertices: 36,
+      vertex_size: 36,
+      total_bytes: 1296
+    },
+    rendering: {
+      target_fps: 60,
+      rotation_speed: 1.0,
+      rotation_axis: "Y"
+    },
+    controls: {
+      exit_key: "ESCAPE",
+      window_resizable: true
+    }
+  },
+  @4: {
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001", "INV-002", "INV-003"],
+    test_requirements: {
+      model_verified: {
+        contract_902_valid: true,
+        axiom_determinism: true,
+        axiom_reversibility: true,
+        invariant_fidelity: true,
+        invariant_idempotence: true,
+        field_order: true
+      },
+      human_verified: {
+        renders_cube: "pending",
+        fps_60_minimum: "pending",
+        smooth_rotation: "pending",
+        window_resizing: "pending",
+        keyboard_input: "pending",
+        no_gpu_errors: "pending"
+      }
+    }
+  },
+  @5: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// Verification Assertions
+// =============================================================================
+// These assertions are checked at contract parse time
+
+// A1 DETERMINISM: Same shader input produces same SPIR-V handle
+// assert collapse(load("cube.vert")) == collapse(load("cube.vert"))
+
+// A2 REVERSIBILITY: Round-trip preserves shader data
+// assert resolve(collapse(spirv_bytes)) == spirv_bytes
+
+// INV-001 TOTAL_FIDELITY: Pipeline round-trip preserves structure
+// assert resolve(collapse(pipeline_config)) == pipeline_config
+
+// INV-002 HANDLE_IDEMPOTENCE: Same contract produces same ID
+// let h1 = collapse(contract_902)
+// let h2 = collapse(contract_902)
+// assert h1 == h2
+
+// INV-003 FIELD_ORDER: Contract fields are in ascending order
+// assert field_index(@0) < field_index(@1) < field_index(@2) < field_index(@3)

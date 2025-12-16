@@ -1,0 +1,44 @@
+{
+  "902": {
+    "@0": "PIPELINE_CONFIG",
+    "@1": "example_graphics_pipeline",
+    "@2": "graphics",
+    "@3": {
+      "@0": {
+        "@0": 0,
+        "@1": "&h_shader_ea82522b4d7f9c8e1a3b5d6f0e2a4c6b8d0f2e4a6c8b0d2e4f6a8c0b2d4e6f8a",
+        "@2": "VERTEX_SHADER"
+      },
+      "@1": {
+        "@0": 1,
+        "@1": "&h_shader_7f3c9a1b5d2e8f6c4a0b9d7e5f3a1c8b6d4e2f0a8c6b4d2e0f9a7c5b3d1e8f6a",
+        "@2": "FRAGMENT_SHADER"
+      }
+    },
+    "@4": {
+      "@0": "TRIANGLE_LIST",
+      "@1": {
+        "@0": 0,
+        "@1": "FLOAT",
+        "@2": 3
+      }
+    },
+    "@5": {
+      "@0": "enable_depth_test",
+      "@1": true,
+      "@2": "LESS"
+    },
+    "@6": {
+      "@0": {
+        "@0": 0,
+        "@1": "UNIFORM_BUFFER",
+        "@2": "Matrices"
+      }
+    },
+    "@7": {
+      "@0": "deterministic",
+      "@1": true,
+      "@2": "axiom_a1_verified"
+    }
+  }
+}

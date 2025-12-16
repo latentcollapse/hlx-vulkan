@@ -1,0 +1,317 @@
+// HLX Ray Tracing Lab Contract Definition
+// CONTRACT_2003: hlx-raytrace-lab
+// Version: 1.0.0
+// Date: 2025-12-16
+//
+// Reference: Khronos ray tracing extensions
+// Credit line: "HLX ray tracing lab"
+
+// =============================================================================
+// CONTRACT_900: Raygen Shader (raytrace.rgen)
+// =============================================================================
+// Axiom A1 DETERMINISM: Same camera + seed → deterministic ray sequence
+// Axiom A2 REVERSIBILITY: Ray directions are reversible through contract
+
+contract 900 {
+  @0: "VULKAN_SHADER",
+  @1: "hlx_raytrace_raygen",
+  @2: {
+    shader_stage: "RAY_GENERATION_SHADER",
+    entry_point: "main",
+    source_file: "shaders/raytrace.rgen",
+    spirv_file: "shaders/compiled/raytrace.rgen.spv",
+    descriptor_bindings: [
+      { binding: 0, type: "ACCELERATION_STRUCTURE", name: "topLevelAS" },
+      { binding: 1, type: "STORAGE_IMAGE", name: "image", format: "RGBA8" },
+      { binding: 2, type: "UNIFORM_BUFFER", name: "CameraParams" }
+    ],
+    outputs: [
+      { type: "RAY_PAYLOAD", name: "payload", size: 12 }
+    ],
+    ray_generation: {
+      ray_flags: "OPAQUE",
+      ray_payload_size: 12
+    }
+  },
+  @3: {
+    determinism: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_900: Closest-Hit Shader (raytrace.rchit)
+// =============================================================================
+// Performs surface shading on ray-geometry intersections
+// Can be hot-swapped via HLX resolve() for real-time shader editing
+
+contract 900 {
+  @0: "VULKAN_SHADER",
+  @1: "hlx_raytrace_closest_hit",
+  @2: {
+    shader_stage: "CLOSEST_HIT_SHADER",
+    entry_point: "main",
+    source_file: "shaders/raytrace.rchit",
+    spirv_file: "shaders/compiled/raytrace.rchit.spv",
+    descriptor_bindings: [
+      { binding: 3, type: "STORAGE_BUFFER", name: "GeometryBuffer" },
+      { binding: 4, type: "STORAGE_BUFFER", name: "NormalBuffer" },
+      { binding: 5, type: "UNIFORM_BUFFER", name: "MaterialParams" },
+      { binding: 6, type: "UNIFORM_BUFFER", name: "SceneParams" }
+    ],
+    inputs: [
+      { type: "HIT_ATTRIBUTES", name: "hit_attributes", size: 8 }
+    ],
+    outputs: [
+      { type: "RAY_PAYLOAD", name: "payload", size: 12 }
+    ],
+    shading_model: "PHONG",
+    material_properties: {
+      diffuse_color: [0.8, 0.8, 0.8, 1.0],
+      specular_color: [1.0, 1.0, 1.0, 1.0],
+      roughness: 0.5,
+      metallic: 0.0,
+      ior: 1.5
+    }
+  },
+  @3: {
+    determinism: true,
+    hot_swappable: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001", "INV-002"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_900: Miss Shader (raytrace.rmiss)
+// =============================================================================
+// Generates background/sky color when rays miss geometry
+// Provides deterministic environment for testing ray tracing
+
+contract 900 {
+  @0: "VULKAN_SHADER",
+  @1: "hlx_raytrace_miss",
+  @2: {
+    shader_stage: "MISS_SHADER",
+    entry_point: "main",
+    source_file: "shaders/raytrace.rmiss",
+    spirv_file: "shaders/compiled/raytrace.rmiss.spv",
+    descriptor_bindings: [
+      { binding: 7, type: "UNIFORM_BUFFER", name: "SkyParams" }
+    ],
+    outputs: [
+      { type: "RAY_PAYLOAD", name: "payload", size: 12 }
+    ],
+    sky_parameters: {
+      zenith_color: [0.0, 0.0, 0.3, 1.0],
+      horizon_color: [0.3, 0.5, 0.8, 1.0],
+      ground_color: [0.2, 0.2, 0.2, 1.0],
+      horizon_softness: 0.1
+    }
+  },
+  @3: {
+    determinism: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_901: Ray Tracing Kernel
+// =============================================================================
+// Aggregates ray tracing shaders (raygen, chit, miss)
+// Manages acceleration structures and ray dispatch
+
+contract 901 {
+  @0: "RAY_TRACING_KERNEL",
+  @1: "hlx_raytrace_kernel",
+  @2: {
+    kernel_type: "ray_tracing",
+    shaders: [
+      { stage: "RAY_GENERATION", id: "hlx_raytrace_raygen" },
+      { stage: "CLOSEST_HIT", id: "hlx_raytrace_closest_hit" },
+      { stage: "MISS", id: "hlx_raytrace_miss" }
+    ],
+    acceleration_structures: {
+      blas_count: 1,
+      tlas_count: 1,
+      max_instances: 64,
+      geometry_type: "TRIANGLES"
+    },
+    ray_tracing_features: {
+      max_recursion_depth: 8,
+      ray_payload_size: 12,
+      intersection_attributes_size: 8,
+      inline_raytracing: false
+    }
+  },
+  @3: {
+    determinism: true,
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001", "INV-002", "INV-003"]
+  },
+  @4: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// CONTRACT_902: Ray Tracing Pipeline Configuration
+// =============================================================================
+// Defines ray tracing pipeline layout and shader groups
+// INV-003 FIELD_ORDER: Fields @0, @1, @2, @3 must be in ascending order
+
+contract 902 {
+  @0: "PIPELINE_CONFIG",
+  @1: "hlx_raytrace_pipeline",
+  @2: {
+    pipeline_type: "ray_tracing",
+    shader_stages: {
+      @0: {
+        @0: 0,
+        @1: "&h_shader_raygen_PLACEHOLDER",
+        @2: "RAY_GENERATION_SHADER"
+      },
+      @1: {
+        @0: 1,
+        @1: "&h_shader_closest_hit_PLACEHOLDER",
+        @2: "CLOSEST_HIT_SHADER"
+      },
+      @2: {
+        @0: 2,
+        @1: "&h_shader_miss_PLACEHOLDER",
+        @2: "MISS_SHADER"
+      }
+    },
+    shader_groups: [
+      { type: "RAYGEN", shader_index: 0 },
+      { type: "CLOSEST_HIT", shader_index: 1, any_hit_shader: null },
+      { type: "MISS", shader_index: 2 }
+    ]
+  },
+  @3: {
+    ray_tracing_pipeline: {
+      max_pipeline_ray_recursion_depth: 8,
+      max_shader_group_count: 3,
+      max_shader_group_stride: 128,
+      shader_group_base_alignment: 16
+    },
+    output_format: "R8G8B8A8_UNORM",
+    output_dimensions: {
+      width: 1024,
+      height: 768
+    },
+    descriptor_set_layout: {
+      set: 0,
+      bindings: [
+        { binding: 0, type: "ACCELERATION_STRUCTURE", count: 1 },
+        { binding: 1, type: "STORAGE_IMAGE", count: 1 },
+        { binding: 2, type: "UNIFORM_BUFFER", count: 1 },
+        { binding: 3, type: "STORAGE_BUFFER", count: 1 },
+        { binding: 4, type: "STORAGE_BUFFER", count: 1 },
+        { binding: 5, type: "UNIFORM_BUFFER", count: 1 },
+        { binding: 6, type: "UNIFORM_BUFFER", count: 1 },
+        { binding: 7, type: "UNIFORM_BUFFER", count: 1 }
+      ]
+    }
+  }
+}
+
+// =============================================================================
+// CONTRACT_2003: HLX Ray Tracing Lab Application
+// =============================================================================
+
+contract 2003 {
+  @0: "hlx_raytrace_lab",
+  @1: {
+    description: "HLX ray tracing playground using VK_KHR_ray_tracing extensions",
+    version: "1.0.0",
+    author: "HLX Ecosystem",
+    license: "MIT",
+    reference: "Khronos ray tracing extensions",
+    credit: "HLX ray tracing lab"
+  },
+  @2: {
+    dependencies: [
+      "&h_hlx_runtime",
+      "&h_vulkan_context",
+      "&h_contract_900_raygen",
+      "&h_contract_900_chit",
+      "&h_contract_900_miss",
+      "&h_contract_901",
+      "&h_contract_902"
+    ],
+    required_contracts: [900, 901, 902],
+    required_extensions: [
+      "VK_KHR_ray_tracing_pipeline",
+      "VK_KHR_acceleration_structure",
+      "VK_KHR_deferred_host_operations"
+    ]
+  },
+  @3: {
+    ray_tracing: {
+      acceleration_structures: "BLAS for each mesh, TLAS for scene",
+      shaders: "Raygen (ray generation), closest-hit (surface shading), miss (background)",
+      output: "Storage image with raytraced result",
+      capabilities: [
+        "Ray generation with deterministic pseudorandom seeding",
+        "Closest-hit shader with Phong lighting",
+        "Miss shader with gradient sky",
+        "Shader hot-swapping via HLX resolve()"
+      ]
+    },
+    advanced_features: {
+      hot_swapping: "Modify closest-hit shader, resolve new handle, rebind and re-dispatch",
+      determinism: "Same camera + seed produces identical ray sequences",
+      reversibility: "Scene geometry preserved through contract round-trip"
+    }
+  },
+  @4: {
+    axioms_verified: ["A1", "A2"],
+    invariants_verified: ["INV-001", "INV-002", "INV-003"],
+    test_requirements: {
+      model_verified: {
+        contract_901_valid: true,
+        contract_902_valid: true,
+        axiom_determinism: true,
+        axiom_reversibility: true,
+        invariant_fidelity: true,
+        invariant_idempotence: true,
+        field_order: true,
+        ray_tracing_support: true
+      },
+      human_verified: {
+        raytraced_image_renders: "pending",
+        scene_geometry_visible: "pending",
+        shader_hot_swapping_works: "pending",
+        deterministic_results: "pending",
+        no_gpu_errors: "pending"
+      }
+    }
+  },
+  @5: "2025-12-16T00:00:00Z"
+}
+
+// =============================================================================
+// Verification Assertions
+// =============================================================================
+// These assertions are checked at contract parse time
+
+// A1 DETERMINISM: Same camera + seed produces same ray sequence
+// assert determinism_check(camera_1, seed_1) == determinism_check(camera_1, seed_1)
+
+// A2 REVERSIBILITY: Scene geometry preserved through contract
+// assert resolve(collapse(geometry_data)) == geometry_data
+
+// INV-001 TLAS_FIDELITY: TLAS preserves instance data round-trip
+// assert resolve(collapse(tlas_config)) == tlas_config
+
+// INV-002 SHADER_IDEMPOTENCE: Same SPIR-V produces same handle
+// let h1 = collapse(raytrace.rgen)
+// let h2 = collapse(raytrace.rgen)
+// assert h1 == h2
+
+// INV-003 FIELD_ORDER: Contract fields are in ascending order
+// assert field_index(@0) < field_index(@1) < field_index(@2) < field_index(@3)

@@ -1,0 +1,355 @@
+// hlx_compute_particles_contract.hlxl
+// HLX Port of Sascha Willems' Compute Particles Demo
+// CONTRACT_2001: Complete compute particle system specification
+//
+// This contract defines the GPU particle system with three contracts:
+// - CONTRACT_900: Vertex and Fragment shaders for rendering
+// - CONTRACT_901: Compute kernel for physics simulation
+// - CONTRACT_902: Graphics pipeline for parallel execution
+
+// =============================================================================
+// CONTRACT_900: Vertex and Fragment Shaders (Point Rendering)
+// =============================================================================
+
+let vert_shader = contract 900 {
+    name: "particle.vert",
+    description: "Vertex shader - renders particles as point primitives",
+
+    bindings: {
+        binding_0: {
+            type: "storage_buffer",
+            name: "ParticleBuffer",
+            access: "read",
+            structure: {
+                element: "vec4",  // xyz = position, w = lifetime
+                count: "dynamic"
+            }
+        },
+        binding_1: {
+            type: "uniform_buffer",
+            name: "RenderParams",
+            structure: {
+                projection: "mat4",
+                view: "mat4",
+                pointSize: "float"
+            }
+        }
+    },
+
+    inputs: {
+        location_0: {
+            type: "vec4",
+            semantic: "particle_data"
+        }
+    },
+
+    outputs: {
+        location_0: {
+            type: "vec4",
+            name: "outColor"
+        },
+        location_1: {
+            type: "float",
+            name: "outLifetime"
+        }
+    },
+
+    entry_point: "main",
+    stage: "vertex",
+
+    axioms: [
+        "A1_DETERMINISM: Same particle data → same vertex output",
+        "A2_REVERSIBILITY: Vertex→Fragment pipeline is reversible"
+    ]
+};
+
+let frag_shader = contract 900 {
+    name: "particle.frag",
+    description: "Fragment shader - colors particles with soft falloff",
+
+    inputs: {
+        location_0: {
+            type: "vec4",
+            name: "inColor"
+        },
+        location_1: {
+            type: "float",
+            name: "inLifetime"
+        }
+    },
+
+    outputs: {
+        location_0: {
+            type: "vec4",
+            name: "outColor"
+        }
+    },
+
+    features: {
+        point_sprites: true,
+        discard_handling: true,
+        smooth_falloff: true
+    },
+
+    entry_point: "main",
+    stage: "fragment"
+};
+
+// =============================================================================
+// CONTRACT_901: Compute Kernel (Particle Physics)
+// =============================================================================
+
+let compute_kernel = contract 901 {
+    name: "particle.comp",
+    description: "Compute kernel - GPU particle physics simulation",
+
+    bindings: {
+        binding_0: {
+            type: "storage_buffer",
+            name: "ParticleBuffer",
+            access: "read_write",
+            structure: {
+                particles: [{position: "vec3", lifetime: "float"}],
+                count: "dynamic"
+            }
+        },
+        binding_1: {
+            type: "storage_buffer",
+            name: "VelocityBuffer",
+            access: "read_write",
+            structure: {
+                velocities: [{velocity: "vec3", speed: "float"}],
+                count: "dynamic"
+            }
+        },
+        binding_2: {
+            type: "uniform_buffer",
+            name: "ParticleParams",
+            structure: {
+                deltaTime: "float",
+                gravity: "float",
+                particleCount: "int",
+                damping: "float"
+            }
+        }
+    },
+
+    compute: {
+        local_size_x: 256,
+        local_size_y: 1,
+        local_size_z: 1,
+        shared_memory: 0
+    },
+
+    physics: {
+        gravity: {
+            enabled: true,
+            direction: "downward",
+            parameter: "params.gravity"
+        },
+        damping: {
+            enabled: true,
+            factor: "params.damping"
+        },
+        timestep: "params.deltaTime"
+    },
+
+    operations: [
+        "position += velocity * deltaTime",
+        "velocity += gravity * deltaTime",
+        "velocity *= damping",
+        "lifetime -= deltaTime",
+        "discard_if(lifetime <= 0.0)"
+    ],
+
+    entry_point: "main",
+    stage: "compute",
+
+    axioms: [
+        "A1_DETERMINISM: Same seed + particle state → same physics results",
+        "A2_REVERSIBILITY: Physics can be reversed by negating forces"
+    ],
+
+    invariants: [
+        "INV-001: All particles maintain finite position coordinates",
+        "INV-002: Lifetime is monotonically decreasing",
+        "INV-003: Dead particles (lifetime ≤ 0) are skipped"
+    ]
+};
+
+// =============================================================================
+// CONTRACT_902: Graphics Pipeline (Rendering)
+// =============================================================================
+
+let graphics_pipeline = contract 902 {
+    name: "particle_graphics_pipeline",
+    description: "Graphics pipeline for particle rendering",
+
+    stages: [vert_shader, frag_shader],
+
+    pipeline_layout: {
+        descriptor_sets: [
+            {
+                bindings: [
+                    {binding: 0, type: "storage_buffer"},
+                    {binding: 1, type: "uniform_buffer"}
+                ]
+            }
+        ]
+    },
+
+    rasterization: {
+        topology: "point_list",
+        polygon_mode: "fill",
+        cull_mode: "back",
+        front_face: "counter_clockwise"
+    },
+
+    multisample: {
+        sample_count: 4,
+        sample_shading_enabled: false
+    },
+
+    color_blend: {
+        attachments: [
+            {
+                blend_enabled: true,
+                src_color_blend_factor: "src_alpha",
+                dst_color_blend_factor: "one",
+                color_blend_op: "add",
+                src_alpha_blend_factor: "one",
+                dst_alpha_blend_factor: "zero",
+                alpha_blend_op: "add"
+            }
+        ]
+    },
+
+    depth_stencil: {
+        depth_test_enabled: true,
+        depth_write_enabled: true,
+        depth_compare_op: "less_or_equal"
+    },
+
+    vertex_input: {
+        bindings: [],
+        attributes: []
+    },
+
+    dynamic_states: ["viewport", "scissor"],
+
+    render_pass: {
+        color_attachments: [{format: "R8G8B8A8_SRGB", load_op: "clear"}],
+        depth_attachment: {format: "D32_SFLOAT", load_op: "clear"}
+    },
+
+    synchronization: {
+        src_stage: "compute_shader",
+        dst_stage: "fragment_shader",
+        dependencies: [
+            {
+                src_stage: "compute_shader",
+                dst_stage: "vertex_input",
+                memory_barrier: "storage_read_write_to_vertex_attribute_read"
+            }
+        ]
+    }
+};
+
+// =============================================================================
+// Execution Specification (CONTRACT_2001)
+// =============================================================================
+
+contract 2001 {
+    task_name: "hlx_compute_particles",
+    description: "HLX port of Sascha Willems compute particles demo",
+
+    reference: "https://github.com/SaschaWillems/Vulkan/tree/master/examples/computeparticles",
+    credit: "HLX port of Sascha Willems' compute particles demo",
+
+    contracts_required: [900, 901, 902],
+
+    architecture: {
+        compute_kernel: "GPU particle physics: position += velocity, apply forces",
+        vertex_shader: "Render particles as point sprites with lifetime-based coloring",
+        fragment_shader: "Fragment processing: soft circle rasterization with alpha falloff",
+        graphics_pipeline: "Integrates compute and graphics stages with synchronization",
+        storage_buffers: "Particle data (position, velocity, lifetime)",
+        uniform_buffers: "Physics parameters and rendering transformation matrices"
+    },
+
+    data_structures: {
+        particle: {
+            position: "vec3 - xyz world position",
+            lifetime: "float - [0.0, max_lifetime], 0 = dead"
+        },
+        velocity: {
+            velocity: "vec3 - xyz velocity vector",
+            speed: "float - cached magnitude"
+        },
+        particle_params: {
+            deltaTime: "float - timestep for physics",
+            gravity: "float - gravitational acceleration magnitude",
+            particleCount: "int - total particle count",
+            damping: "float - energy loss factor [0, 1]"
+        }
+    },
+
+    execution_flow: [
+        "1. Emit particles from emitter point",
+        "2. Dispatch compute shader to update physics in parallel",
+        "3. Insert memory barrier (compute write → vertex read)",
+        "4. Dispatch graphics pipeline",
+        "5. Vertex shader transforms particles to screen space",
+        "6. Rasterizer generates fragments (point sprites)",
+        "7. Fragment shader applies soft circle and alpha blending",
+        "8. Output to framebuffer"
+    ],
+
+    test_axioms: {
+        A1_DETERMINISM: {
+            description: "Same seed → same particle behavior across frames",
+            verification: "Run simulation twice with same seed, verify bit-identical results",
+            implementation: "Deterministic PRNG (xorshift64*) in emitter"
+        },
+        A2_REVERSIBILITY: {
+            description: "Contract round-trip is reversible (collapse/resolve)",
+            verification: "Serialize particles, deserialize, verify state matches",
+            implementation: "All data structures are copyable and serializable"
+        }
+    },
+
+    test_invariants: {
+        INV_001: "All live particles have finite position coordinates",
+        INV_002: "Particle lifetime is monotonically decreasing",
+        INV_003: "Dead particles (lifetime ≤ 0) are never rendered",
+        INV_004: "Velocity is bounded by physics parameters"
+    },
+
+    performance_targets: {
+        min_fps: 60,
+        particle_count: 10000,
+        dispatch_size: [256, 1, 1],
+        memory_usage: "~320 KB (10K particles × 32 bytes)"
+    },
+
+    human_verification: {
+        particles_spawn: "Particles appear on screen from emitter",
+        particles_move: "Particles move smoothly downward (gravity)",
+        color_gradient: "Particles shift color from blue→red as they age",
+        lifetime_expiry: "Particles disappear after 3 seconds",
+        frame_rate: "Maintains 60+ FPS with 10K particles"
+    },
+
+    deliverables: [
+        "src/bin/hlx_compute_particles.rs (250+ lines)",
+        "shaders/particle.comp (compute shader)",
+        "shaders/particle.vert (vertex shader)",
+        "shaders/particle.frag (fragment shader)",
+        "examples/hlx_compute_particles_contract.hlxl (this file)",
+        "README_COMPUTE_PARTICLES.md (documentation)"
+    ],
+
+    estimated_time: "20 minutes",
+    model: "haiku",
+    cost: "$2-3"
+}

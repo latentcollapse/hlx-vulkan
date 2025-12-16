@@ -1,0 +1,127 @@
+// hlx_nbody_contract.hlxl
+// HLX N-body Simulation Contract
+// Khronos-based gravitational physics on GPU
+
+contract 2002 {
+  task_name: "hlx_nbody",
+  description: "N-body gravitational physics simulation with GPU compute",
+
+  reference: &h_khronos_nbody,
+  credit: "HLX port of Khronos N-body simulation",
+
+  dependencies: [
+    &h_hlx_runtime_complete,
+    &h_phase2_complete,
+    &h_tier1_tools_complete
+  ],
+
+  contracts_required: [900, 901, 902],
+
+  architecture: {
+    "compute_kernel": "N-body force calculation: F = G*m1*m2/r^2",
+    "shader_stages": "Compute (forces), Vertex (sphere rendering), Fragment (Phong)",
+    "contract_901": "Compute shader: nbody.comp with shared memory optimization",
+    "contract_902": "Graphics pipeline: vertex + fragment shaders",
+    "storage_buffer": "Body data: mass, position, velocity as float4",
+    "pipeline": "Dispatch compute shader → Update velocities → Render spheres"
+  },
+
+  implementation_steps: [
+    "create_body_storage_buffer_float4_layout",
+    "compile_compute_shader_nbody_forces_with_shared_memory",
+    "implement_softening_parameter_for_stability",
+    "compile_vertex_shader_sphere_instanced_rendering",
+    "compile_fragment_shader_phong_shading",
+    "create_contract_901_nbody_kernel",
+    "create_contract_902_render_pipeline",
+    "implement_timestep_integration",
+    "test_physics_determinism",
+    "test_performance_scalability_1000_bodies"
+  ],
+
+  test_requirements: {
+    model_verified: {
+      axiom_determinism: true,
+      axiom_reversibility: true,
+      contract_901_valid: true,
+      contract_902_valid: true
+    },
+    human_verified: {
+      bodies_render: true,
+      bodies_orbit_realistically: true,
+      "60fps_with_1000_bodies": true,
+      deterministic_same_seed: true
+    }
+  },
+
+  deliverables: [
+    "src/bin/hlx_nbody.rs (300+ lines)",
+    "shaders/nbody.comp (compute shader with shared memory)",
+    "shaders/sphere.vert (vertex shader)",
+    "shaders/sphere.frag (fragment shader with Phong)",
+    "examples/hlx_nbody_contract.hlxl",
+    "README_NBODY.md"
+  ],
+
+  axioms: [
+    {
+      name: "A1_DETERMINISM",
+      statement: "Same initial conditions → Same orbits",
+      verification: "Run simulation twice with same seed, compare positions/velocities"
+    },
+    {
+      name: "A2_REVERSIBILITY",
+      statement: "Contract stores initial state for reversibility",
+      verification: "Extract initial state from contract, restart simulation"
+    },
+    {
+      name: "INV-001",
+      statement: "Body count remains constant",
+      verification: "Assert len(bodies) == initial_count throughout simulation"
+    },
+    {
+      name: "INV-002",
+      statement: "Physical laws conserve momentum (with softening)",
+      verification: "Monitor center-of-mass position drift < threshold"
+    },
+    {
+      name: "INV-003",
+      statement: "Render performance: 60 FPS with 1000 bodies",
+      verification: "Frame time < 16.67ms for 1000 bodies"
+    }
+  ],
+
+  estimated_time: "20 minutes",
+  model: "haiku",
+  cost: "$2-3"
+}
+
+// Shader references for integration
+contract 900 {
+  shader_type: "compute",
+  stage: "nbody_compute",
+  shader_id: "&h_shader_nbody_comp",
+  descriptor_bindings: [
+    {binding: 0, type: "STORAGE_BUFFER", name: "BodyData"},
+    {binding: 1, type: "STORAGE_BUFFER", name: "BodyVelocity"}
+  ]
+}
+
+contract 900 {
+  shader_type: "vertex",
+  stage: "sphere_vertex",
+  shader_id: "&h_shader_sphere_vert",
+  descriptor_bindings: [
+    {binding: 0, type: "UNIFORM_BUFFER", name: "NBodyMatrices"},
+    {binding: 2, type: "STORAGE_BUFFER", name: "BodyData"}
+  ]
+}
+
+contract 900 {
+  shader_type: "fragment",
+  stage: "sphere_fragment",
+  shader_id: "&h_shader_sphere_frag",
+  descriptor_bindings: [
+    {binding: 1, type: "UNIFORM_BUFFER", name: "LightingParams"}
+  ]
+}

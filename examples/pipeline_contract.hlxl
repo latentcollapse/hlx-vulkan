@@ -1,0 +1,63 @@
+// HLX CONTRACT_902: Graphics Pipeline Configuration
+// Example HLXL format for hlx-pipeline-cli
+//
+// Usage:
+//   hlx-pipeline-cli create pipeline_contract.hlxl --parse-hlxl
+//
+// This contract defines a complete graphics pipeline with:
+// - Vertex and fragment shaders
+// - Vertex input configuration
+// - Depth testing
+// - Uniform buffer bindings
+
+contract 902 {
+    // @0: Pipeline configuration type
+    pipeline_id: "example_graphics_pipeline",
+
+    // @1: Shader stages (references to ShaderDatabase)
+    stages: [
+        &h_shader_ea82522b4d7f9c8e1a3b5d6f0e2a4c6b8d0f2e4a6c8b0d2e4f6a8c0b2d4e6f8a,
+        &h_shader_7f3c9a1b5d2e8f6c4a0b9d7e5f3a1c8b6d4e2f0a8c6b4d2e0f9a7c5b3d1e8f6a
+    ],
+
+    // @2: Synchronization barriers between stages
+    sync_barriers: [],
+
+    // @3: Output framebuffer/image handle
+    output_image: &h_framebuffer_default
+}
+
+// Axioms verified by this contract:
+//
+// A1 DETERMINISM:
+//   Same pipeline_id + stages + sync_barriers + output_image
+//   always produces the same pipeline handle.
+//
+// A2 REVERSIBILITY:
+//   Pipeline handle can be resolved back to this contract.
+//
+// Invariants:
+//
+// INV-001 TOTAL_FIDELITY:
+//   This contract can round-trip through encode/decode.
+//
+// INV-002 HANDLE_IDEMPOTENCE:
+//   Creating this pipeline twice returns the same handle.
+//
+// INV-003 FIELD_ORDER:
+//   Fields @0, @1, @2, @3 are in ascending order.
+
+// Alternative format with symbolic field names:
+//
+// contract 902 {
+//     pipeline_id: "my_pipeline",
+//     stages: [&h_vert, &h_frag],
+//     sync_barriers: [{stage_idx: 0, memory_scope: "device"}],
+//     output_image: &h_fb
+// }
+
+// Field name to index mapping:
+//   pipeline_id    -> @0
+//   stages         -> @1
+//   sync_barriers  -> @2
+//   output_image   -> @3

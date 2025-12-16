@@ -1,0 +1,28 @@
+[package]
+name = "hlx-compute-particles"
+version = "0.1.0"
+edition = "2021"
+authors = ["HLX Contributors"]
+description = "HLX port of Sascha Willems' compute particles demo - GPU particle system"
+license = "MIT"
+
+[[bin]]
+name = "hlx_compute_particles"
+path = "src/bin/hlx_compute_particles.rs"
+
+[dependencies]
+# No external dependencies for the standalone binary
+# In a full implementation, would depend on:
+# - hlx_vulkan (for Vulkan bindings)
+# - ash (for raw Vulkan)
+# - winit (for windowing)
+# - glam (for math, already in hlx_vulkan)
+
+[dev-dependencies]
+# Testing framework
+pretty_assertions = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

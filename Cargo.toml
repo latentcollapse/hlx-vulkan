@@ -10,11 +10,30 @@ repository = "https://github.com/matt/hlx-vulkan"
 
 [lib]
 name = "hlx_vulkan"
-crate-type = ["cdylib"]  # Required for PyO3
+crate-type = ["cdylib", "rlib"]  # cdylib for PyO3, rlib for binaries
+
+[[bin]]
+name = "hlx_shader_compiler"
+path = "src/bin/hlx_shader_compiler.rs"
+
+[[bin]]
+name = "hlx_pipeline_cli"
+path = "src/bin/hlx_pipeline_cli.rs"
+
+[[bin]]
+name = "hlx_demo_cube"
+path = "src/bin/hlx_demo_cube.rs"
 
 [dependencies]
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
 # Vulkan bindings - thin wrapper, full control
 ash = "0.38"
+
+# Window management and Vulkan surface creation
+winit = "0.28"
+raw-window-handle = "0.6"
+ash-window = "0.13"
 
 # PyO3 for Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"] }

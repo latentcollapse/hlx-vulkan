@@ -1,0 +1,96 @@
+#version 450
+
+// N-body force calculation compute shader
+// Implements gravitational physics: F = G*m1*m2/r^2
+// Uses shared memory optimization for O(n²) force calculation
+// Based on Khronos N-body simulation
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Storage buffer: body data (mass, position, velocity as vec4)
+// struct Body {
+//   vec4 pos;     // position in xyz, mass in w
+//   vec4 vel;     // velocity in xyz, padding in w
+// };
+
+layout(std430, binding = 0) buffer BodyData {
+    vec4 positions[];
+} bodyPos;
+
+layout(std430, binding = 1) buffer BodyVelocity {
+    vec4 velocities[];
+} bodyVel;
+
+// Shared memory for optimized force calculation
+shared vec4 sharedPos[256];  // Cache positions from other bodies
+
+// Gravitational constant and softening parameter
+uniform float G;
+uniform float softeningFactor;
+uniform float deltaTime;
+uniform uint numBodies;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    if (id >= numBodies) {
+        return;
+    }
+
+    // Load current body's position (position.w contains mass)
+    vec4 myPos = bodyPos.positions[id];
+    vec3 force = vec3(0.0);
+
+    // Iterate over all other bodies
+    uint bodyCount = numBodies;
+
+    for (uint blockStart = 0; blockStart < bodyCount; blockStart += gl_WorkGroupSize.x) {
+        // Load body into shared memory
+        uint idx = blockStart + gl_LocalInvocationID.x;
+        if (idx < bodyCount) {
+            sharedPos[gl_LocalInvocationID.x] = bodyPos.positions[idx];
+        }
+
+        // Synchronize all threads in work group
+        memoryBarrierShared();
+        barrier();
+
+        // Compute forces from all bodies in this block
+        for (uint i = 0; i < gl_WorkGroupSize.x; i++) {
+            uint otherIdx = blockStart + i;
+            if (otherIdx < bodyCount && otherIdx != id) {
+                vec4 otherPos = sharedPos[i];
+                vec3 r = otherPos.xyz - myPos.xyz;
+
+                // Distance with softening to avoid singularities
+                float rDist = length(r) + softeningFactor;
+                float rDistCubed = rDist * rDist * rDist;
+
+                // F = G * m1 * m2 / r^2
+                // Normalized to r^3 for acceleration calculation
+                float myMass = myPos.w;
+                float otherMass = otherPos.w;
+                float forceMagnitude = G * myMass * otherMass / rDistCubed;
+
+                force += forceMagnitude * r;
+            }
+        }
+
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // Load current velocity
+    vec4 vel = bodyVel.velocities[id];
+
+    // Update velocity: a = F / m, v_new = v + a * dt
+    float myMass = myPos.w;
+    vec3 acceleration = force / myMass;
+    vel.xyz += acceleration * deltaTime;
+
+    // Store updated velocity
+    bodyVel.velocities[id] = vel;
+
+    // Update position: x_new = x + v * dt
+    // (Position update typically happens in separate pass or in graphics shader)
+}
