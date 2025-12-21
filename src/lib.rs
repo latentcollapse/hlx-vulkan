@@ -33,11 +33,31 @@ mod shader;
 mod validation;
 mod pipeline;
 mod buffer;
+mod compute;
+mod gradient_kernel;
+mod tensor_buffer;
+
+// Transformer modules (from Opus)
+pub mod tensor;
+mod transformer_config;
+mod gemm_kernel;
+mod attention_kernel;
+mod transformer_layer;
 
 pub use context::VulkanContext;
 pub use error::VulkanErrorKind;
 pub use pipeline::{GraphicsPipeline, create_simple_render_pass};
 pub use buffer::Buffer;
+pub use compute::{ComputePipeline, CommandBufferPool, DescriptorBindingBuilder};
+pub use gradient_kernel::{GradientKernel, GradientPushConstants, GradientParameters};
+pub use tensor_buffer::{TensorBuffer, TensorPool, MemoryArena, ArenaStats, PoolStats};
+
+// Transformer exports
+pub use tensor::Tensor;
+pub use transformer_config::TransformerConfig;
+pub use gemm_kernel::{GemmKernel, LinearLayer};
+pub use attention_kernel::MultiHeadAttention;
+pub use transformer_layer::{TransformerLayer, TransformerModel};
 
 /// HLX Vulkan Python module
 ///

@@ -11,6 +11,7 @@ use crate::error::VulkanErrorKind;
 ///
 /// Manages both the buffer and its backing GPU memory.
 /// Handles data upload via memory mapping.
+#[derive(Clone)]
 pub struct Buffer {
     /// Vulkan buffer handle
     pub buffer: vk::Buffer,
@@ -165,6 +166,59 @@ impl Buffer {
         Ok(())
     }
 
+    /// Download data from the buffer to CPU memory.
+    ///
+    /// Memory must be HOST_VISIBLE for this to work.
+    /// Automatically handles mapping/unmapping.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Mutable slice to receive the data
+    ///
+    /// # Returns
+    ///
+    /// Ok if download succeeds
+    pub fn download_data<T: Copy>(&self, data: &mut [T]) -> Result<(), VulkanErrorKind> {
+        let data_size = (data.len() * std::mem::size_of::<T>()) as u64;
+
+        if data_size > self.size {
+            return Err(VulkanErrorKind::InitializationFailed(format!(
+                "Request size {} exceeds buffer size {}",
+                data_size, self.size
+            )));
+        }
+
+        // Map memory to CPU address space
+        let mapped_ptr = unsafe {
+            self.device
+                .map_memory(self.memory, 0, data_size, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|e| {
+            VulkanErrorKind::InitializationFailed(format!(
+                "Failed to map buffer memory: {:?}",
+                e
+            ))
+        })?;
+
+        // Copy data from mapped memory
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapped_ptr as *const u8,
+                data.as_mut_ptr() as *mut u8,
+                data_size as usize,
+            );
+        }
+
+        // Unmap memory
+        unsafe {
+            self.device.unmap_memory(self.memory);
+        }
+
+        log::debug!("Downloaded {} bytes from buffer", data_size);
+
+        Ok(())
+    }
+
     /// Get the buffer handle for use in commands
     pub fn handle(&self) -> vk::Buffer {
         self.buffer
@@ -178,6 +232,26 @@ impl Buffer {
     /// Check if buffer is empty
     pub fn is_empty(&self) -> bool {
         self.size == 0
+    }
+
+    // =============================================================================
+    // ADAPTER LAYER FOR OPUS TRANSFORMER CODE
+    // =============================================================================
+
+    /// Adapter method: Returns buffer handle (Opus API compatibility)
+    ///
+    /// Opus code expects `buffer()` method instead of `handle()`.
+    /// This is a thin wrapper to make the APIs compatible.
+    pub fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    /// Adapter method: Upload raw bytes (Opus API compatibility)
+    ///
+    /// Opus code expects `upload_bytes(&[u8])` instead of `upload_data<T>(&[T])`.
+    /// This is a thin wrapper that casts to u8 slice.
+    pub fn upload_bytes(&self, data: &[u8]) -> Result<(), VulkanErrorKind> {
+        self.upload_data(data)
     }
 }
 

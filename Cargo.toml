@@ -24,6 +24,10 @@ path = "src/bin/hlx_pipeline_cli.rs"
 name = "hlx_demo_cube"
 path = "src/bin/hlx_demo_cube.rs"
 
+[[bin]]
+name = "hlx_vulkan_train"
+path = "src/bin/hlx_vulkan_train.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4.4", features = ["derive"] }
@@ -48,6 +52,9 @@ env_logger = "0.11"
 # JSON parsing
 serde_json = "1.0"
 
+# Cryptographic hashing (content addressing)
+sha2 = "0.10"
+
 [dev-dependencies]
 # Testing
 pretty_assertions = "1.4"
@@ -55,6 +62,7 @@ pretty_assertions = "1.4"
 [features]
 default = []
 validation = []  # Enable Vulkan validation layers by default
+validate_determinism = []  # Runtime determinism testing (5-run bitwise comparison)
 
 [profile.release]
 lto = true

@@ -51,6 +51,10 @@ pub enum VulkanErrorKind {
     /// Buffer not found in cache
     #[error("Buffer not found: {0}")]
     BufferNotFound(String),
+
+    /// Generic error (Opus transformer API compatibility)
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Convert VulkanErrorKind to Python exception
