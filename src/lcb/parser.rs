@@ -1,450 +1,405 @@
-//! LC-B Binary Parser
+//! LC-B Binary Format Parser
 //!
-//! Parses LC-B instruction batches into structured data for contract execution.
-//! Implements LEB128 variable-length integer encoding for compact representation.
+//! Parses LC-B (Low-level Contract Binary) instruction batches.
+//! Format:
+//!   - Magic: "LCB!" (4 bytes)
+//!   - Version: LEB128
+//!   - Num instructions: LEB128
+//!   - Instructions: [contract_id, tensors, scalars]...
+//!   - SHA256 signature (32 bytes)
 
-use std::io::{Cursor, Read};
 use std::collections::HashMap;
 
-use super::{LCB_MAGIC, LCB_VERSION};
-
-/// Parsed LC-B instruction batch
-#[derive(Debug, Clone)]
-pub struct LCBBatch {
-    pub version: u8,
-    pub batch_id: [u8; 32],
-    pub instructions: Vec<Instruction>,
-    pub signature: [u8; 32],
+/// Supported data types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DType {
+    Float32 = 0,
+    Float16 = 1,
+    Int32 = 2,
+    UInt32 = 3,
 }
 
-/// Single instruction within a batch
-#[derive(Debug, Clone)]
-pub struct Instruction {
-    pub contract_id: u16,
-    pub params: HashMap<String, Param>,
-    pub chain_from: Option<usize>,  // Index of instruction to chain result from
-}
-
-/// Parameter value types
-#[derive(Debug, Clone)]
-pub enum Param {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Text(String),
-    Bytes(Vec<u8>),
-    Array(Vec<Param>),
-    Object(HashMap<String, Param>),
-    Handle([u8; 32]),  // CAS handle reference
-    ChainPrevious,     // Use result from previous instruction
-    ChainFrom(usize),  // Use result from specific instruction index
-}
-
-/// Parse error types
-#[derive(Debug)]
-pub enum ParseError {
-    InvalidMagic(u32),
-    UnsupportedVersion(u8),
-    UnexpectedEOF,
-    InvalidUtf8,
-    InvalidSignature,
-    MalformedInstruction(String),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl DType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(DType::Float32),
+            1 => Some(DType::Float16),
+            2 => Some(DType::Int32),
+            3 => Some(DType::UInt32),
+            _ => None,
+        }
+    }
+    
+    pub fn size_bytes(&self) -> usize {
         match self {
-            ParseError::InvalidMagic(m) => write!(f, "Invalid magic: 0x{:08X}", m),
-            ParseError::UnsupportedVersion(v) => write!(f, "Unsupported version: {}", v),
-            ParseError::UnexpectedEOF => write!(f, "Unexpected end of input"),
-            ParseError::InvalidUtf8 => write!(f, "Invalid UTF-8 string"),
-            ParseError::InvalidSignature => write!(f, "Signature verification failed"),
-            ParseError::MalformedInstruction(msg) => write!(f, "Malformed instruction: {}", msg),
+            DType::Float32 | DType::Int32 | DType::UInt32 => 4,
+            DType::Float16 => 2,
         }
     }
 }
 
-impl std::error::Error for ParseError {}
-
-/// Parse a complete LC-B instruction batch
-pub fn parse_batch(data: &[u8]) -> Result<LCBBatch, ParseError> {
-    let mut cursor = Cursor::new(data);
-
-    // Parse header
-    let magic = read_u32_le(&mut cursor)?;
-    if magic != LCB_MAGIC {
-        return Err(ParseError::InvalidMagic(magic));
-    }
-
-    let version = read_u8(&mut cursor)?;
-    if version != LCB_VERSION {
-        return Err(ParseError::UnsupportedVersion(version));
-    }
-
-    let mut batch_id = [0u8; 32];
-    cursor.read_exact(&mut batch_id).map_err(|_| ParseError::UnexpectedEOF)?;
-
-    let instruction_count = read_leb128_u32(&mut cursor)? as usize;
-
-    // Parse instructions
-    let mut instructions = Vec::with_capacity(instruction_count);
-    for _ in 0..instruction_count {
-        let instr = parse_instruction(&mut cursor)?;
-        instructions.push(instr);
-    }
-
-    // Parse signature
-    let mut signature = [0u8; 32];
-    cursor.read_exact(&mut signature).map_err(|_| ParseError::UnexpectedEOF)?;
-
-    // Verify signature (SHA256 of everything before signature)
-    let data_len = data.len() - 32;
-    let computed_sig = sha256_hash(&data[..data_len]);
-    if computed_sig != signature {
-        return Err(ParseError::InvalidSignature);
-    }
-
-    Ok(LCBBatch {
-        version,
-        batch_id,
-        instructions,
-        signature,
-    })
+/// Tensor data extracted from LC-B
+#[derive(Debug, Clone)]
+pub struct TensorData {
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+    pub data: Vec<u8>,
 }
 
-/// Parse a single instruction
-fn parse_instruction(cursor: &mut Cursor<&[u8]>) -> Result<Instruction, ParseError> {
-    let contract_id = read_leb128_u32(cursor)? as u16;
-    let param_count = read_leb128_u32(cursor)? as usize;
+impl TensorData {
+    /// Number of elements in tensor
+    pub fn num_elements(&self) -> usize {
+        self.shape.iter().product()
+    }
+    
+    /// Get data as f32 slice (only valid if dtype is Float32)
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        if self.dtype != DType::Float32 {
+            return None;
+        }
+        let ptr = self.data.as_ptr() as *const f32;
+        let len = self.data.len() / 4;
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+    
+    /// Get data as mutable f32 slice
+    pub fn as_f32_mut(&mut self) -> Option<&mut [f32]> {
+        if self.dtype != DType::Float32 {
+            return None;
+        }
+        let ptr = self.data.as_mut_ptr() as *mut f32;
+        let len = self.data.len() / 4;
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+    }
+    
+    /// Create tensor from f32 data
+    pub fn from_f32(data: &[f32], shape: Vec<usize>) -> Self {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        Self {
+            dtype: DType::Float32,
+            shape,
+            data: bytes.to_vec(),
+        }
+    }
+}
 
-    let mut params = HashMap::new();
-    let mut chain_from = None;
+/// A single LC-B instruction
+#[derive(Debug, Clone)]
+pub struct LCBInstruction {
+    pub contract_id: u32,
+    pub tensors: Vec<TensorData>,
+    pub scalars: HashMap<String, f32>,
+}
 
-    for _ in 0..param_count {
-        // Read param name (length-prefixed string)
-        let name_len = read_leb128_u32(cursor)? as usize;
-        let name = read_string(cursor, name_len)?;
+/// Contract IDs
+pub mod contracts {
+    pub const GEMM: u32 = 906;
+    pub const LAYERNORM: u32 = 907;
+    pub const GELU: u32 = 908;
+    pub const SOFTMAX: u32 = 909;
+    pub const CROSS_ENTROPY: u32 = 910;
+}
 
-        // Read param value
-        let value = parse_param(cursor)?;
+/// Parsed LC-B batch
+#[derive(Debug)]
+pub struct LCBBatch {
+    pub version: u32,
+    pub instructions: Vec<LCBInstruction>,
+}
 
-        // Check for chaining directives
-        match &value {
-            Param::ChainPrevious => {
-                // Mark this instruction to receive previous result
+/// Parser for LC-B binary format
+pub struct LCBParser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> LCBParser<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+    
+    /// Parse complete LC-B batch
+    pub fn parse(&mut self) -> Result<LCBBatch, String> {
+        // Verify minimum size (magic + version + count + signature)
+        if self.data.len() < 4 + 1 + 1 + 32 {
+            return Err("LC-B data too short".to_string());
+        }
+        
+        // Check magic
+        if &self.data[0..4] != b"LCB!" {
+            return Err(format!("Invalid magic: expected 'LCB!', got {:?}", &self.data[0..4]));
+        }
+        self.pos = 4;
+        
+        // Verify SHA256 signature
+        let content_len = self.data.len() - 32;
+        let expected_sig = &self.data[content_len..];
+        let actual_sig = sha256(&self.data[..content_len]);
+        if expected_sig != actual_sig.as_slice() {
+            return Err("SHA256 signature mismatch".to_string());
+        }
+        
+        // Parse version
+        let version = self.read_leb128()? as u32;
+        if version != 1 {
+            return Err(format!("Unsupported LC-B version: {}", version));
+        }
+        
+        // Parse instruction count
+        let num_instructions = self.read_leb128()? as usize;
+        
+        // Parse instructions
+        let mut instructions = Vec::with_capacity(num_instructions);
+        for i in 0..num_instructions {
+            let instr = self.parse_instruction()
+                .map_err(|e| format!("Instruction {}: {}", i, e))?;
+            instructions.push(instr);
+        }
+        
+        Ok(LCBBatch { version, instructions })
+    }
+    
+    fn parse_instruction(&mut self) -> Result<LCBInstruction, String> {
+        // Contract ID
+        let contract_id = self.read_leb128()? as u32;
+        
+        // Tensors
+        let num_tensors = self.read_leb128()? as usize;
+        let mut tensors = Vec::with_capacity(num_tensors);
+        
+        for _ in 0..num_tensors {
+            let tensor = self.parse_tensor()?;
+            tensors.push(tensor);
+        }
+        
+        // Scalars
+        let num_scalars = self.read_leb128()? as usize;
+        let mut scalars = HashMap::with_capacity(num_scalars);
+        
+        for _ in 0..num_scalars {
+            let name_len = self.read_leb128()? as usize;
+            let name = self.read_string(name_len)?;
+            let value = self.read_f32()?;
+            scalars.insert(name, value);
+        }
+        
+        Ok(LCBInstruction { contract_id, tensors, scalars })
+    }
+    
+    fn parse_tensor(&mut self) -> Result<TensorData, String> {
+        // dtype (1 byte)
+        if self.pos >= self.data.len() {
+            return Err("Unexpected end of data while reading dtype".to_string());
+        }
+        let dtype_byte = self.data[self.pos];
+        self.pos += 1;
+        
+        let dtype = DType::from_u8(dtype_byte)
+            .ok_or_else(|| format!("Unknown dtype: {}", dtype_byte))?;
+        
+        // ndim
+        let ndim = self.read_leb128()? as usize;
+        
+        // shape
+        let mut shape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            let dim = self.read_leb128()? as usize;
+            shape.push(dim);
+        }
+        
+        // Calculate data size
+        let num_elements: usize = shape.iter().product();
+        let data_size = num_elements * dtype.size_bytes();
+        
+        // Read data
+        if self.pos + data_size > self.data.len() - 32 { // -32 for signature
+            return Err(format!(
+                "Not enough data for tensor: need {} bytes, have {}",
+                data_size,
+                self.data.len() - 32 - self.pos
+            ));
+        }
+        
+        let data = self.data[self.pos..self.pos + data_size].to_vec();
+        self.pos += data_size;
+        
+        Ok(TensorData { dtype, shape, data })
+    }
+    
+    /// Read unsigned LEB128 encoded integer
+    fn read_leb128(&mut self) -> Result<u64, String> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        
+        loop {
+            if self.pos >= self.data.len() {
+                return Err("Unexpected end of data while reading LEB128".to_string());
             }
-            Param::ChainFrom(idx) => {
-                chain_from = Some(*idx);
+            
+            let byte = self.data[self.pos];
+            self.pos += 1;
+            
+            result |= ((byte & 0x7F) as u64) << shift;
+            
+            if byte & 0x80 == 0 {
+                break;
             }
-            _ => {}
-        }
-
-        params.insert(name, value);
-    }
-
-    Ok(Instruction {
-        contract_id,
-        params,
-        chain_from,
-    })
-}
-
-/// Parse a single parameter value
-fn parse_param(cursor: &mut Cursor<&[u8]>) -> Result<Param, ParseError> {
-    let type_tag = read_u8(cursor)?;
-
-    match type_tag {
-        0 => Ok(Param::Null),
-        1 => Ok(Param::Bool(read_u8(cursor)? != 0)),
-        2 => Ok(Param::Int(read_leb128_i64(cursor)?)),
-        3 => Ok(Param::Float(read_f64_le(cursor)?)),
-        4 => {
-            // Text: length-prefixed UTF-8 string
-            let len = read_leb128_u32(cursor)? as usize;
-            let text = read_string(cursor, len)?;
-            Ok(Param::Text(text))
-        }
-        5 => {
-            // Bytes: length-prefixed raw bytes
-            let len = read_leb128_u32(cursor)? as usize;
-            let mut bytes = vec![0u8; len];
-            cursor.read_exact(&mut bytes).map_err(|_| ParseError::UnexpectedEOF)?;
-            Ok(Param::Bytes(bytes))
-        }
-        6 => {
-            // Array
-            let len = read_leb128_u32(cursor)? as usize;
-            let mut arr = Vec::with_capacity(len);
-            for _ in 0..len {
-                arr.push(parse_param(cursor)?);
+            
+            shift += 7;
+            if shift >= 64 {
+                return Err("LEB128 overflow".to_string());
             }
-            Ok(Param::Array(arr))
         }
-        7 => {
-            // Object
-            let len = read_leb128_u32(cursor)? as usize;
-            let mut obj = HashMap::new();
-            for _ in 0..len {
-                let key_len = read_leb128_u32(cursor)? as usize;
-                let key = read_string(cursor, key_len)?;
-                let value = parse_param(cursor)?;
-                obj.insert(key, value);
-            }
-            Ok(Param::Object(obj))
+        
+        Ok(result)
+    }
+    
+    fn read_string(&mut self, len: usize) -> Result<String, String> {
+        if self.pos + len > self.data.len() {
+            return Err("Unexpected end of data while reading string".to_string());
         }
-        8 => {
-            // Handle (32-byte CAS reference)
-            let mut handle = [0u8; 32];
-            cursor.read_exact(&mut handle).map_err(|_| ParseError::UnexpectedEOF)?;
-            Ok(Param::Handle(handle))
+        
+        let bytes = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| format!("Invalid UTF-8: {}", e))
+    }
+    
+    fn read_f32(&mut self) -> Result<f32, String> {
+        if self.pos + 4 > self.data.len() {
+            return Err("Unexpected end of data while reading f32".to_string());
         }
-        9 => Ok(Param::ChainPrevious),
-        10 => {
-            let idx = read_leb128_u32(cursor)? as usize;
-            Ok(Param::ChainFrom(idx))
-        }
-        _ => Err(ParseError::MalformedInstruction(format!("Unknown type tag: {}", type_tag))),
+        
+        let bytes = [
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ];
+        self.pos += 4;
+        
+        Ok(f32::from_le_bytes(bytes))
     }
 }
 
-// Helper functions for reading binary data
-
-fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, ParseError> {
-    let mut buf = [0u8; 1];
-    cursor.read_exact(&mut buf).map_err(|_| ParseError::UnexpectedEOF)?;
-    Ok(buf[0])
-}
-
-fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> Result<u32, ParseError> {
-    let mut buf = [0u8; 4];
-    cursor.read_exact(&mut buf).map_err(|_| ParseError::UnexpectedEOF)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_f64_le(cursor: &mut Cursor<&[u8]>) -> Result<f64, ParseError> {
-    let mut buf = [0u8; 8];
-    cursor.read_exact(&mut buf).map_err(|_| ParseError::UnexpectedEOF)?;
-    Ok(f64::from_le_bytes(buf))
-}
-
-fn read_string(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<String, ParseError> {
-    let mut buf = vec![0u8; len];
-    cursor.read_exact(&mut buf).map_err(|_| ParseError::UnexpectedEOF)?;
-    String::from_utf8(buf).map_err(|_| ParseError::InvalidUtf8)
-}
-
-/// Read unsigned LEB128 encoded integer
-fn read_leb128_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, ParseError> {
-    let mut result = 0u32;
-    let mut shift = 0;
-
-    loop {
-        let byte = read_u8(cursor)?;
-        result |= ((byte & 0x7F) as u32) << shift;
-
-        if byte & 0x80 == 0 {
-            break;
-        }
-
-        shift += 7;
-        if shift >= 35 {
-            return Err(ParseError::MalformedInstruction("LEB128 overflow".to_string()));
-        }
+/// Simple SHA-256 implementation
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use std::num::Wrapping;
+    
+    // Initial hash values
+    let mut h: [Wrapping<u32>; 8] = [
+        Wrapping(0x6a09e667), Wrapping(0xbb67ae85), Wrapping(0x3c6ef372), Wrapping(0xa54ff53a),
+        Wrapping(0x510e527f), Wrapping(0x9b05688c), Wrapping(0x1f83d9ab), Wrapping(0x5be0cd19),
+    ];
+    
+    // Round constants
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    
+    // Padding
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
     }
-
-    Ok(result)
-}
-
-/// Read signed LEB128 encoded integer
-fn read_leb128_i64(cursor: &mut Cursor<&[u8]>) -> Result<i64, ParseError> {
-    let mut result = 0i64;
-    let mut shift = 0;
-    let mut byte;
-
-    loop {
-        byte = read_u8(cursor)?;
-        result |= ((byte & 0x7F) as i64) << shift;
-        shift += 7;
-
-        if byte & 0x80 == 0 {
-            break;
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    
+    // Process blocks
+    for chunk in padded.chunks(64) {
+        let mut w = [Wrapping(0u32); 64];
+        
+        for (i, word) in chunk.chunks(4).enumerate() {
+            w[i] = Wrapping(u32::from_be_bytes([word[0], word[1], word[2], word[3]]));
         }
-
-        if shift >= 70 {
-            return Err(ParseError::MalformedInstruction("LEB128 overflow".to_string()));
+        
+        for i in 16..64 {
+            let s0 = (w[i-15].0.rotate_right(7)) ^ (w[i-15].0.rotate_right(18)) ^ (w[i-15].0 >> 3);
+            let s1 = (w[i-2].0.rotate_right(17)) ^ (w[i-2].0.rotate_right(19)) ^ (w[i-2].0 >> 10);
+            w[i] = w[i-16] + Wrapping(s0) + w[i-7] + Wrapping(s1);
         }
-    }
-
-    // Sign extend if negative
-    if shift < 64 && (byte & 0x40) != 0 {
-        result |= !0i64 << shift;
-    }
-
-    Ok(result)
-}
-
-/// Compute SHA256 hash (cross-platform compatible with Python)
-fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
-
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-
-    let mut output = [0u8; 32];
-    output.copy_from_slice(&result);
-    output
-}
-
-// Builder functions for creating LC-B batches (for testing)
-
-/// Build an LC-B batch from instructions
-pub struct LCBBuilder {
-    instructions: Vec<Instruction>,
-}
-
-impl LCBBuilder {
-    pub fn new() -> Self {
-        LCBBuilder {
-            instructions: Vec::new(),
+        
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = 
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        
+        for i in 0..64 {
+            let s1 = Wrapping(e.0.rotate_right(6) ^ e.0.rotate_right(11) ^ e.0.rotate_right(25));
+            let ch = Wrapping((e.0 & f.0) ^ ((!e.0) & g.0));
+            let temp1 = hh + s1 + ch + Wrapping(K[i]) + w[i];
+            let s0 = Wrapping(a.0.rotate_right(2) ^ a.0.rotate_right(13) ^ a.0.rotate_right(22));
+            let maj = Wrapping((a.0 & b.0) ^ (a.0 & c.0) ^ (b.0 & c.0));
+            let temp2 = s0 + maj;
+            
+            hh = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
         }
+        
+        h[0] = h[0] + a;
+        h[1] = h[1] + b;
+        h[2] = h[2] + c;
+        h[3] = h[3] + d;
+        h[4] = h[4] + e;
+        h[5] = h[5] + f;
+        h[6] = h[6] + g;
+        h[7] = h[7] + hh;
     }
-
-    pub fn add_instruction(mut self, contract_id: u16, params: HashMap<String, Param>) -> Self {
-        self.instructions.push(Instruction {
-            contract_id,
-            params,
-            chain_from: None,
-        });
-        self
+    
+    let mut result = [0u8; 32];
+    for (i, &hash) in h.iter().enumerate() {
+        result[i*4..i*4+4].copy_from_slice(&hash.0.to_be_bytes());
     }
-
-    pub fn build(self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Header
-        data.extend_from_slice(&LCB_MAGIC.to_le_bytes());
-        data.push(LCB_VERSION);
-
-        // Batch ID (generate deterministically from instructions)
-        let batch_id = sha256_hash(&self.instructions.len().to_le_bytes());
-        data.extend_from_slice(&batch_id);
-
-        // Instruction count
-        write_leb128_u32(&mut data, self.instructions.len() as u32);
-
-        // Instructions
-        for instr in &self.instructions {
-            write_instruction(&mut data, instr);
-        }
-
-        // Compute and append signature
-        let signature = sha256_hash(&data);
-        data.extend_from_slice(&signature);
-
-        data
-    }
+    result
 }
 
-fn write_leb128_u32(data: &mut Vec<u8>, mut value: u32) {
+/// Serialize a tensor to LC-B format
+pub fn serialize_tensor(tensor: &TensorData) -> Vec<u8> {
+    let mut buf = Vec::new();
+    
+    // dtype (1 byte)
+    buf.push(tensor.dtype as u8);
+    
+    // ndim (LEB128)
+    write_leb128(&mut buf, tensor.shape.len() as u64);
+    
+    // shape (each dim as LEB128)
+    for &dim in &tensor.shape {
+        write_leb128(&mut buf, dim as u64);
+    }
+    
+    // data (raw bytes)
+    buf.extend_from_slice(&tensor.data);
+    
+    buf
+}
+
+/// Write unsigned LEB128
+fn write_leb128(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
         }
-        data.push(byte);
+        buf.push(byte);
         if value == 0 {
-            break;
-        }
-    }
-}
-
-fn write_instruction(data: &mut Vec<u8>, instr: &Instruction) {
-    write_leb128_u32(data, instr.contract_id as u32);
-    write_leb128_u32(data, instr.params.len() as u32);
-
-    for (name, value) in &instr.params {
-        // Write param name
-        write_leb128_u32(data, name.len() as u32);
-        data.extend_from_slice(name.as_bytes());
-
-        // Write param value
-        write_param(data, value);
-    }
-}
-
-fn write_param(data: &mut Vec<u8>, param: &Param) {
-    match param {
-        Param::Null => data.push(0),
-        Param::Bool(b) => {
-            data.push(1);
-            data.push(if *b { 1 } else { 0 });
-        }
-        Param::Int(i) => {
-            data.push(2);
-            write_leb128_i64(data, *i);
-        }
-        Param::Float(f) => {
-            data.push(3);
-            data.extend_from_slice(&f.to_le_bytes());
-        }
-        Param::Text(s) => {
-            data.push(4);
-            write_leb128_u32(data, s.len() as u32);
-            data.extend_from_slice(s.as_bytes());
-        }
-        Param::Bytes(b) => {
-            data.push(5);
-            write_leb128_u32(data, b.len() as u32);
-            data.extend_from_slice(b);
-        }
-        Param::Array(arr) => {
-            data.push(6);
-            write_leb128_u32(data, arr.len() as u32);
-            for item in arr {
-                write_param(data, item);
-            }
-        }
-        Param::Object(obj) => {
-            data.push(7);
-            write_leb128_u32(data, obj.len() as u32);
-            for (key, value) in obj {
-                write_leb128_u32(data, key.len() as u32);
-                data.extend_from_slice(key.as_bytes());
-                write_param(data, value);
-            }
-        }
-        Param::Handle(h) => {
-            data.push(8);
-            data.extend_from_slice(h);
-        }
-        Param::ChainPrevious => data.push(9),
-        Param::ChainFrom(idx) => {
-            data.push(10);
-            write_leb128_u32(data, *idx as u32);
-        }
-    }
-}
-
-fn write_leb128_i64(data: &mut Vec<u8>, mut value: i64) {
-    let negative = value < 0;
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-
-        let more = if negative {
-            value != -1 || (byte & 0x40) == 0
-        } else {
-            value != 0 || (byte & 0x40) != 0
-        };
-
-        if more {
-            byte |= 0x80;
-        }
-        data.push(byte);
-        if !more {
             break;
         }
     }
@@ -453,32 +408,51 @@ fn write_leb128_i64(data: &mut Vec<u8>, mut value: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_leb128_roundtrip() {
-        let values = [0u32, 1, 127, 128, 16383, 16384, u32::MAX];
-        for val in values {
-            let mut data = Vec::new();
-            write_leb128_u32(&mut data, val);
-
-            let mut cursor = Cursor::new(data.as_slice());
-            let decoded = read_leb128_u32(&mut cursor).unwrap();
-            assert_eq!(val, decoded);
+        let test_values = [0, 1, 127, 128, 255, 256, 16383, 16384, u32::MAX as u64];
+        for &v in &test_values {
+            let mut buf = Vec::new();
+            write_leb128(&mut buf, v);
+            
+            let mut parser = LCBParser::new(&buf);
+            let parsed = parser.read_leb128().unwrap();
+            assert_eq!(v, parsed, "LEB128 roundtrip failed for {}", v);
         }
     }
-
+    
     #[test]
-    fn test_batch_roundtrip() {
-        let mut params = HashMap::new();
-        params.insert("count".to_string(), Param::Int(42));
-        params.insert("name".to_string(), Param::Text("test".to_string()));
-
-        let batch_bytes = LCBBuilder::new()
-            .add_instruction(906, params)
-            .build();
-
-        let batch = parse_batch(&batch_bytes).unwrap();
-        assert_eq!(batch.instructions.len(), 1);
-        assert_eq!(batch.instructions[0].contract_id, 906);
+    fn test_sha256() {
+        // Test vector: empty string
+        let hash = sha256(b"");
+        let expected = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+            0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(hash, expected);
+    }
+    
+    #[test]
+    fn test_dtype_size() {
+        assert_eq!(DType::Float32.size_bytes(), 4);
+        assert_eq!(DType::Float16.size_bytes(), 2);
+        assert_eq!(DType::Int32.size_bytes(), 4);
+        assert_eq!(DType::UInt32.size_bytes(), 4);
+    }
+    
+    #[test]
+    fn test_tensor_from_f32() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tensor = TensorData::from_f32(&data, vec![2, 3]);
+        
+        assert_eq!(tensor.dtype, DType::Float32);
+        assert_eq!(tensor.shape, vec![2, 3]);
+        assert_eq!(tensor.num_elements(), 6);
+        
+        let recovered = tensor.as_f32().unwrap();
+        assert_eq!(recovered, data.as_slice());
     }
 }

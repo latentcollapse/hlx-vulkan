@@ -1,613 +1,773 @@
-//! LC-B Contract Executor
+//! LC-B Executor
 //!
-//! Dispatches parsed LC-B instructions to Vulkan GPU contracts.
-//! Manages result caching for instruction chaining.
+//! Executes LC-B instruction batches on the GPU.
+//! Routes contract IDs to appropriate Vulkan compute kernels.
 
-use std::collections::HashMap;
+use std::sync::Arc;
+use ash::{vk, Device};
 
-use super::parser::{LCBBatch, Instruction, Param};
-use super::contract_ids::*;
+use crate::lcb::parser::{LCBBatch, LCBInstruction, TensorData, DType, contracts};
 
-/// Result from contract execution
-#[derive(Debug, Clone)]
-pub enum ContractResult {
-    /// Null/void result
-    Null,
-    /// Boolean result
-    Bool(bool),
-    /// Integer result
-    Int(i64),
-    /// Float result
-    Float(f64),
-    /// Tensor result (flattened f32 array with shape)
-    Tensor {
-        data: Vec<f32>,
-        shape: Vec<usize>,
-    },
-    /// Handle to stored result in CAS
-    Handle([u8; 32]),
-    /// Error result
-    Error(String),
-}
-
-/// Execution error types
-#[derive(Debug)]
-pub enum LCBError {
-    UnknownContract(u16),
-    InvalidParam { name: String, expected: String },
-    MissingParam(String),
-    ChainError { index: usize, msg: String },
-    VulkanError(String),
-    ExecutionFailed(String),
-}
-
-impl std::fmt::Display for LCBError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LCBError::UnknownContract(id) => write!(f, "Unknown contract ID: {}", id),
-            LCBError::InvalidParam { name, expected } =>
-                write!(f, "Invalid param '{}': expected {}", name, expected),
-            LCBError::MissingParam(name) => write!(f, "Missing required param: {}", name),
-            LCBError::ChainError { index, msg } =>
-                write!(f, "Chain error from instruction {}: {}", index, msg),
-            LCBError::VulkanError(msg) => write!(f, "Vulkan error: {}", msg),
-            LCBError::ExecutionFailed(msg) => write!(f, "Execution failed: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for LCBError {}
-
-/// LC-B instruction batch executor
+/// GPU execution context
 pub struct LCBExecutor {
-    /// Results from each instruction (for chaining)
-    result_cache: Vec<ContractResult>,
-    /// Execution statistics
-    stats: ExecutionStats,
+    device: Arc<Device>,
+    compute_queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    
+    // Compute pipelines
+    gemm_pipeline: vk::Pipeline,
+    layernorm_pipeline: vk::Pipeline,
+    gelu_pipeline: vk::Pipeline,
+    softmax_pipeline: vk::Pipeline,
+    cross_entropy_pipeline: vk::Pipeline,
+    
+    // Pipeline layout and descriptor resources
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 }
 
-#[derive(Debug, Default)]
-pub struct ExecutionStats {
-    pub instructions_executed: usize,
-    pub contracts_dispatched: HashMap<u16, usize>,
-    pub total_time_ms: f64,
-    pub chain_operations: usize,
+/// Result of executing an LC-B batch
+pub struct ExecutionResult {
+    pub outputs: Vec<TensorData>,
 }
 
 impl LCBExecutor {
-    pub fn new() -> Self {
-        LCBExecutor {
-            result_cache: Vec::new(),
-            stats: ExecutionStats::default(),
-        }
+    /// Create a new executor with initialized GPU resources
+    pub fn new(
+        device: Arc<Device>,
+        compute_queue: vk::Queue,
+        queue_family_index: u32,
+        memory_properties: vk::PhysicalDeviceMemoryProperties,
+        shader_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        // Create command pool
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        
+        let command_pool = unsafe {
+            device.create_command_pool(&pool_info, None)
+        }.map_err(|e| format!("Failed to create command pool: {:?}", e))?;
+        
+        // Allocate command buffer
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        
+        let command_buffers = unsafe {
+            device.allocate_command_buffers(&alloc_info)
+        }.map_err(|e| format!("Failed to allocate command buffer: {:?}", e))?;
+        
+        let command_buffer = command_buffers[0];
+        
+        // Create fence
+        let fence = unsafe {
+            device.create_fence(&vk::FenceCreateInfo::default(), None)
+        }.map_err(|e| format!("Failed to create fence: {:?}", e))?;
+        
+        // Create descriptor set layout (8 storage buffers)
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..8)
+            .map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&bindings);
+        
+        let descriptor_set_layout = unsafe {
+            device.create_descriptor_set_layout(&layout_info, None)
+        }.map_err(|e| format!("Failed to create descriptor set layout: {:?}", e))?;
+        
+        // Create pipeline layout with push constants
+        let push_constant_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(32);
+        
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range));
+        
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(&pipeline_layout_info, None)
+        }.map_err(|e| format!("Failed to create pipeline layout: {:?}", e))?;
+        
+        // Create descriptor pool
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(256),
+        ];
+        
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(32)
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+        
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(&pool_info, None)
+        }.map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?;
+        
+        // Load and create pipelines
+        let load_pipeline = |name: &str| -> Result<vk::Pipeline, String> {
+            let path = shader_dir.join(format!("{}.spv", name));
+            let spv = std::fs::read(&path)
+                .map_err(|e| format!("Failed to load {}: {}", name, e))?;
+            
+            // Create shader module
+            let code: Vec<u32> = spv.chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            
+            let module_info = vk::ShaderModuleCreateInfo::default().code(&code);
+            let shader_module = unsafe {
+                device.create_shader_module(&module_info, None)
+            }.map_err(|e| format!("Failed to create shader module: {:?}", e))?;
+            
+            // Create pipeline
+            let entry_point = std::ffi::CString::new("main").unwrap();
+            let stage_info = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader_module)
+                .name(&entry_point);
+            
+            let pipeline_info = vk::ComputePipelineCreateInfo::default()
+                .stage(stage_info)
+                .layout(pipeline_layout);
+            
+            let pipelines = unsafe {
+                device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            }.map_err(|e| format!("Failed to create pipeline: {:?}", e.1))?;
+            
+            // Cleanup shader module (pipeline keeps reference)
+            unsafe {
+                device.destroy_shader_module(shader_module, None);
+            }
+            
+            Ok(pipelines[0])
+        };
+        
+        let gemm_pipeline = load_pipeline("gemm")?;
+        let layernorm_pipeline = load_pipeline("layernorm_forward")?;
+        let gelu_pipeline = load_pipeline("gelu_forward")?;
+        let softmax_pipeline = load_pipeline("softmax_forward")?;
+        let cross_entropy_pipeline = load_pipeline("cross_entropy_forward")?;
+        
+        Ok(Self {
+            device,
+            compute_queue,
+            command_pool,
+            command_buffer,
+            fence,
+            memory_properties,
+            gemm_pipeline,
+            layernorm_pipeline,
+            gelu_pipeline,
+            softmax_pipeline,
+            cross_entropy_pipeline,
+            pipeline_layout,
+            descriptor_pool,
+            descriptor_set_layout,
+        })
     }
-
-    /// Execute a complete LC-B batch
-    pub fn execute_batch(&mut self, batch: &LCBBatch) -> Result<Vec<ContractResult>, LCBError> {
-        let start = std::time::Instant::now();
-        self.result_cache.clear();
-
-        let mut results = Vec::with_capacity(batch.instructions.len());
-
-        for (idx, instr) in batch.instructions.iter().enumerate() {
-            let result = self.execute_instruction(idx, instr)?;
-
-            // Cache result for potential chaining
-            self.result_cache.push(result.clone());
-            results.push(result);
-
-            // Update stats
-            self.stats.instructions_executed += 1;
-            *self.stats.contracts_dispatched.entry(instr.contract_id).or_insert(0) += 1;
+    
+    /// Execute an LC-B batch and return results
+    pub fn execute(&mut self, batch: &LCBBatch) -> Result<ExecutionResult, String> {
+        let mut outputs = Vec::new();
+        
+        for instruction in &batch.instructions {
+            let result = self.execute_instruction(instruction)?;
+            outputs.extend(result);
         }
-
-        self.stats.total_time_ms = start.elapsed().as_secs_f64() * 1000.0;
-        Ok(results)
+        
+        Ok(ExecutionResult { outputs })
     }
-
-    /// Execute a single instruction
-    fn execute_instruction(&mut self, idx: usize, instr: &Instruction)
-        -> Result<ContractResult, LCBError>
-    {
+    
+    fn execute_instruction(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
         match instr.contract_id {
-            // Parser tier contracts (800-806)
-            BINARY_SERIALIZER => self.execute_binary_serializer(instr),
-            INSTRUCTION_PARSER => self.execute_instruction_parser(instr),
-            TYPE_VALIDATOR => self.execute_type_validator(instr),
-            DETERMINISM_VERIFIER => self.execute_determinism_verifier(instr),
-            CONTRACT_VALIDATOR => self.execute_contract_validator(instr),
-            ERROR_HANDLER => self.execute_error_handler(instr),
-
-            // GPU tier contracts (900-902) - existing
-            VULKAN_SHADER => self.execute_vulkan_shader(instr),
-            COMPUTE_KERNEL => self.execute_compute_kernel(instr),
-            PIPELINE_CONFIG => self.execute_pipeline_config(instr),
-
-            // Transformer contracts (903-905) - NEW
-            TRANSFORMER_FORWARD => self.execute_transformer_forward(instr),
-            TRANSFORMER_BACKWARD => self.execute_transformer_backward(instr),
-            ADAM_OPTIMIZER => self.execute_adam_optimizer(instr),
-
-            // Tensor contracts (906-910) - NEW
-            TENSOR_GEMM => self.execute_tensor_gemm(instr),
-            TENSOR_LAYERNORM => self.execute_tensor_layernorm(instr),
-            TENSOR_GELU => self.execute_tensor_gelu(instr),
-            TENSOR_SOFTMAX => self.execute_tensor_softmax(instr),
-            TENSOR_CROSS_ENTROPY => self.execute_tensor_cross_entropy(instr),
-
-            _ => Err(LCBError::UnknownContract(instr.contract_id)),
+            contracts::GEMM => self.execute_gemm(instr),
+            contracts::LAYERNORM => self.execute_layernorm(instr),
+            contracts::GELU => self.execute_gelu(instr),
+            contracts::SOFTMAX => self.execute_softmax(instr),
+            contracts::CROSS_ENTROPY => self.execute_cross_entropy(instr),
+            _ => Err(format!("Unknown contract ID: {}", instr.contract_id)),
         }
     }
-
-    /// Resolve a parameter, handling chaining directives
-    fn resolve_param<'a>(&'a self, instr: &'a Instruction, name: &str)
-        -> Result<&'a Param, LCBError>
-    {
-        let param = instr.params.get(name)
-            .ok_or_else(|| LCBError::MissingParam(name.to_string()))?;
-
-        // Note: ChainPrevious/ChainFrom would be resolved differently
-        // For now, return the param directly
-        Ok(param)
-    }
-
-    /// Get chained result from previous instruction
-    fn get_chain_result(&self, idx: usize) -> Result<&ContractResult, LCBError> {
-        if idx >= self.result_cache.len() {
-            return Err(LCBError::ChainError {
-                index: idx,
-                msg: format!("Instruction {} not yet executed", idx),
-            });
+    
+    /// Execute GEMM: C = A @ B
+    fn execute_gemm(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
+        if instr.tensors.len() != 2 {
+            return Err(format!("GEMM expects 2 tensors, got {}", instr.tensors.len()));
         }
-        Ok(&self.result_cache[idx])
+        
+        let a = &instr.tensors[0];
+        let b = &instr.tensors[1];
+        
+        // Validate shapes
+        if a.shape.len() != 2 || b.shape.len() != 2 {
+            return Err("GEMM requires 2D tensors".to_string());
+        }
+        
+        let m = a.shape[0];
+        let k = a.shape[1];
+        let n = b.shape[1];
+        
+        if b.shape[0] != k {
+            return Err(format!(
+                "GEMM dimension mismatch: A is {}x{}, B is {}x{}",
+                m, k, b.shape[0], b.shape[1]
+            ));
+        }
+        
+        // Allocate output buffer
+        let output_size = m * n;
+        let mut output_data = vec![0.0f32; output_size];
+        
+        // Create GPU buffers
+        let a_buffer = self.create_buffer_with_data(a)?;
+        let b_buffer = self.create_buffer_with_data(b)?;
+        let c_buffer = self.create_buffer((output_size * 4) as u64)?;
+        
+        // Allocate descriptor set
+        let desc_set = self.allocate_descriptor_set()?;
+        
+        // Update descriptor set
+        self.update_descriptor_set(desc_set, &[
+            (0, a_buffer.0, (a.data.len()) as u64),
+            (1, b_buffer.0, (b.data.len()) as u64),
+            (2, c_buffer.0, (output_size * 4) as u64),
+        ]);
+        
+        // Push constants
+        #[repr(C)]
+        struct GemmPush {
+            m: u32,
+            k: u32,
+            n: u32,
+            use_bias: u32,
+        }
+        
+        let push = GemmPush {
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            use_bias: 0,
+        };
+        
+        // Record and execute
+        self.execute_pipeline(
+            self.gemm_pipeline,
+            desc_set,
+            &push,
+            ((n + 15) / 16) as u32,
+            ((m + 15) / 16) as u32,
+            1,
+        )?;
+        
+        // Download result
+        self.download_buffer(c_buffer.1, &mut output_data)?;
+        
+        // Cleanup
+        self.destroy_buffer(a_buffer);
+        self.destroy_buffer(b_buffer);
+        self.destroy_buffer(c_buffer);
+        self.free_descriptor_set(desc_set)?;
+        
+        Ok(vec![TensorData::from_f32(&output_data, vec![m, n])])
     }
+    
+    /// Execute LayerNorm
+    fn execute_layernorm(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
+        if instr.tensors.is_empty() {
+            return Err("LayerNorm requires at least 1 tensor".to_string());
+        }
+        
+        let x = &instr.tensors[0];
+        let eps = instr.scalars.get("eps").copied().unwrap_or(1e-5);
+        
+        if x.shape.len() != 2 {
+            return Err("LayerNorm expects 2D tensor [batch, features]".to_string());
+        }
+        
+        let num_rows = x.shape[0];
+        let row_size = x.shape[1];
+        let total_size = num_rows * row_size;
+        
+        // Allocate output
+        let mut output_data = vec![0.0f32; total_size];
+        
+        // Create buffers
+        let x_buffer = self.create_buffer_with_data(x)?;
+        let y_buffer = self.create_buffer((total_size * 4) as u64)?;
+        let stats_buffer = self.create_buffer((num_rows * 2 * 4) as u64)?; // mean + inv_std
 
+        // Gamma and beta (ones and zeros if not provided)
+        let gamma = if instr.tensors.len() > 1 {
+            instr.tensors[1].clone()
+        } else {
+            TensorData::from_f32(&vec![1.0f32; row_size], vec![row_size])
+        };
+
+        let beta = if instr.tensors.len() > 2 {
+            instr.tensors[2].clone()
+        } else {
+            TensorData::from_f32(&vec![0.0f32; row_size], vec![row_size])
+        };
+
+        let gamma_buffer = self.create_buffer_with_data(&gamma)?;
+        let beta_buffer = self.create_buffer_with_data(&beta)?;
+
+        // Descriptor set - MATCH SHADER BINDING ORDER!
+        // binding 0: input, 1: output, 2: gamma, 3: beta, 4: stats
+        let desc_set = self.allocate_descriptor_set()?;
+        self.update_descriptor_set(desc_set, &[
+            (0, x_buffer.0, (x.data.len()) as u64),
+            (1, y_buffer.0, (total_size * 4) as u64),
+            (2, gamma_buffer.0, (gamma.data.len()) as u64),
+            (3, beta_buffer.0, (beta.data.len()) as u64),
+            (4, stats_buffer.0, (num_rows * 2 * 4) as u64),
+        ]);
+        
+        // Push constants
+        #[repr(C)]
+        struct LayerNormPush {
+            num_rows: u32,
+            row_size: u32,
+            eps: f32,
+            _pad: u32,
+        }
+        
+        let push = LayerNormPush {
+            num_rows: num_rows as u32,
+            row_size: row_size as u32,
+            eps,
+            _pad: 0,
+        };
+        
+        self.execute_pipeline(
+            self.layernorm_pipeline,
+            desc_set,
+            &push,
+            num_rows as u32,
+            1,
+            1,
+        )?;
+        
+        // Download result
+        self.download_buffer(y_buffer.1, &mut output_data)?;
+        
+        // Cleanup
+        self.destroy_buffer(x_buffer);
+        self.destroy_buffer(y_buffer);
+        self.destroy_buffer(stats_buffer);
+        self.destroy_buffer(gamma_buffer);
+        self.destroy_buffer(beta_buffer);
+        self.free_descriptor_set(desc_set)?;
+        
+        Ok(vec![TensorData::from_f32(&output_data, x.shape.clone())])
+    }
+    
+    /// Execute GELU activation
+    fn execute_gelu(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
+        if instr.tensors.is_empty() {
+            return Err("GELU requires 1 tensor".to_string());
+        }
+        
+        let x = &instr.tensors[0];
+        let num_elements = x.num_elements();
+        let mut output_data = vec![0.0f32; num_elements];
+        
+        let x_buffer = self.create_buffer_with_data(x)?;
+        let y_buffer = self.create_buffer((num_elements * 4) as u64)?;
+        
+        let desc_set = self.allocate_descriptor_set()?;
+        self.update_descriptor_set(desc_set, &[
+            (0, x_buffer.0, x.data.len() as u64),
+            (1, y_buffer.0, (num_elements * 4) as u64),
+        ]);
+        
+        #[repr(C)]
+        struct GeluPush {
+            num_elements: u32,
+        }
+        
+        let push = GeluPush { num_elements: num_elements as u32 };
+        
+        self.execute_pipeline(
+            self.gelu_pipeline,
+            desc_set,
+            &push,
+            ((num_elements + 255) / 256) as u32,
+            1,
+            1,
+        )?;
+        
+        self.download_buffer(y_buffer.1, &mut output_data)?;
+        
+        self.destroy_buffer(x_buffer);
+        self.destroy_buffer(y_buffer);
+        self.free_descriptor_set(desc_set)?;
+        
+        Ok(vec![TensorData::from_f32(&output_data, x.shape.clone())])
+    }
+    
+    /// Execute Softmax
+    fn execute_softmax(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
+        if instr.tensors.is_empty() {
+            return Err("Softmax requires 1 tensor".to_string());
+        }
+        
+        let x = &instr.tensors[0];
+        
+        if x.shape.len() != 2 {
+            return Err("Softmax expects 2D tensor".to_string());
+        }
+        
+        let num_rows = x.shape[0];
+        let row_size = x.shape[1];
+        let total_size = num_rows * row_size;
+        let mut output_data = vec![0.0f32; total_size];
+        
+        let x_buffer = self.create_buffer_with_data(x)?;
+        let y_buffer = self.create_buffer((total_size * 4) as u64)?;
+        
+        let desc_set = self.allocate_descriptor_set()?;
+        self.update_descriptor_set(desc_set, &[
+            (0, x_buffer.0, x.data.len() as u64),
+            (1, y_buffer.0, (total_size * 4) as u64),
+        ]);
+        
+        #[repr(C)]
+        struct SoftmaxPush {
+            num_rows: u32,
+            row_size: u32,
+        }
+        
+        let push = SoftmaxPush {
+            num_rows: num_rows as u32,
+            row_size: row_size as u32,
+        };
+        
+        self.execute_pipeline(
+            self.softmax_pipeline,
+            desc_set,
+            &push,
+            num_rows as u32,
+            1,
+            1,
+        )?;
+        
+        self.download_buffer(y_buffer.1, &mut output_data)?;
+        
+        self.destroy_buffer(x_buffer);
+        self.destroy_buffer(y_buffer);
+        self.free_descriptor_set(desc_set)?;
+        
+        Ok(vec![TensorData::from_f32(&output_data, x.shape.clone())])
+    }
+    
+    /// Execute Cross-Entropy Loss
+    fn execute_cross_entropy(&mut self, instr: &LCBInstruction) -> Result<Vec<TensorData>, String> {
+        if instr.tensors.len() < 2 {
+            return Err("CrossEntropy requires 2 tensors (logits, targets)".to_string());
+        }
+        
+        let logits = &instr.tensors[0];
+        let targets = &instr.tensors[1];
+        
+        if logits.shape.len() != 2 {
+            return Err("CrossEntropy logits must be 2D [batch, vocab]".to_string());
+        }
+        
+        let num_positions = logits.shape[0];
+        let vocab_size = logits.shape[1];
+        
+        // Output: per-position losses
+        let mut losses = vec![0.0f32; num_positions];
+        let mut softmax_out = vec![0.0f32; num_positions * vocab_size];
+        
+        let logits_buffer = self.create_buffer_with_data(logits)?;
+        let targets_buffer = self.create_buffer_with_data(targets)?;
+        let losses_buffer = self.create_buffer((num_positions * 4) as u64)?;
+        let softmax_buffer = self.create_buffer((num_positions * vocab_size * 4) as u64)?;
+        
+        let desc_set = self.allocate_descriptor_set()?;
+        self.update_descriptor_set(desc_set, &[
+            (0, logits_buffer.0, logits.data.len() as u64),
+            (1, targets_buffer.0, targets.data.len() as u64),
+            (2, losses_buffer.0, (num_positions * 4) as u64),
+            (3, softmax_buffer.0, (num_positions * vocab_size * 4) as u64),
+        ]);
+        
+        #[repr(C)]
+        struct CEPush {
+            num_positions: u32,
+            vocab_size: u32,
+            ignore_index: u32,
+        }
+
+        // Note: negative f32 values saturate to 0 when cast to u32 in Rust
+        // So we treat any negative ignore_index as "ignore nothing" (0xFFFFFFFF)
+        let ignore_index = instr.scalars.get("ignore_index")
+            .map(|&v| if v < 0.0 { 0xFFFFFFFF } else { v as u32 })
+            .unwrap_or(0xFFFFFFFF);  // Default: ignore nothing
+
+        let push = CEPush {
+            num_positions: num_positions as u32,
+            vocab_size: vocab_size as u32,
+            ignore_index,
+        };
+        
+        self.execute_pipeline(
+            self.cross_entropy_pipeline,
+            desc_set,
+            &push,
+            num_positions as u32,
+            1,
+            1,
+        )?;
+        
+        self.download_buffer(losses_buffer.1, &mut losses)?;
+        self.download_buffer(softmax_buffer.1, &mut softmax_out)?;
+
+        // Compute mean loss
+        let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+
+        self.destroy_buffer(logits_buffer);
+        self.destroy_buffer(targets_buffer);
+        self.destroy_buffer(losses_buffer);
+        self.destroy_buffer(softmax_buffer);
+        self.free_descriptor_set(desc_set)?;
+
+        // Return mean loss as scalar
+        Ok(vec![
+            TensorData::from_f32(&[mean_loss], vec![1]),
+        ])
+    }
+    
     // =========================================================================
-    // Parser Tier Contracts (800-806)
+    // Helper methods
     // =========================================================================
-
-    fn execute_binary_serializer(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_800: Encode/decode LC-B binary
-        let mode = self.get_text_param(instr, "mode")?;
-
-        match mode.as_str() {
-            "encode" => {
-                // Encode value to LC-B bytes
-                // For now, return placeholder
-                Ok(ContractResult::Null)
+    
+    fn find_memory_type(&self, type_filter: u32, properties: vk::MemoryPropertyFlags) -> Result<u32, String> {
+        for i in 0..self.memory_properties.memory_type_count {
+            if (type_filter & (1 << i)) != 0 
+                && self.memory_properties.memory_types[i as usize].property_flags.contains(properties) {
+                return Ok(i);
             }
-            "decode" => {
-                // Decode LC-B bytes to value
-                Ok(ContractResult::Null)
-            }
-            "validate" => {
-                // Validate LC-B structure
-                Ok(ContractResult::Bool(true))
-            }
-            _ => Err(LCBError::InvalidParam {
-                name: "mode".to_string(),
-                expected: "encode|decode|validate".to_string(),
-            }),
+        }
+        Err("No suitable memory type".to_string())
+    }
+    
+    fn create_buffer(&self, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        
+        let buffer = unsafe {
+            self.device.create_buffer(&buffer_info, None)
+        }.map_err(|e| format!("Create buffer failed: {:?}", e))?;
+        
+        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = self.find_memory_type(
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(memory_type);
+        
+        let memory = unsafe {
+            self.device.allocate_memory(&alloc_info, None)
+        }.map_err(|e| format!("Allocate memory failed: {:?}", e))?;
+        
+        unsafe {
+            self.device.bind_buffer_memory(buffer, memory, 0)
+        }.map_err(|e| format!("Bind memory failed: {:?}", e))?;
+        
+        Ok((buffer, memory))
+    }
+    
+    fn create_buffer_with_data(&self, tensor: &TensorData) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        let (buffer, memory) = self.create_buffer(tensor.data.len() as u64)?;
+        
+        unsafe {
+            let ptr = self.device.map_memory(memory, 0, tensor.data.len() as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("Map memory failed: {:?}", e))?;
+            std::ptr::copy_nonoverlapping(tensor.data.as_ptr(), ptr as *mut u8, tensor.data.len());
+            self.device.unmap_memory(memory);
+        }
+        
+        Ok((buffer, memory))
+    }
+    
+    fn download_buffer(&self, memory: vk::DeviceMemory, data: &mut [f32]) -> Result<(), String> {
+        let size = (data.len() * 4) as u64;
+        unsafe {
+            let ptr = self.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("Map memory failed: {:?}", e))?;
+            std::ptr::copy_nonoverlapping(ptr as *const f32, data.as_mut_ptr(), data.len());
+            self.device.unmap_memory(memory);
+        }
+        Ok(())
+    }
+    
+    fn destroy_buffer(&self, buffer: (vk::Buffer, vk::DeviceMemory)) {
+        unsafe {
+            self.device.destroy_buffer(buffer.0, None);
+            self.device.free_memory(buffer.1, None);
         }
     }
-
-    fn execute_instruction_parser(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_801: Parse LC-B instruction sequences
-        Ok(ContractResult::Null)
+    
+    fn allocate_descriptor_set(&self) -> Result<vk::DescriptorSet, String> {
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+        
+        let sets = unsafe {
+            self.device.allocate_descriptor_sets(&alloc_info)
+        }.map_err(|e| format!("Allocate descriptor set failed: {:?}", e))?;
+        
+        Ok(sets[0])
     }
-
-    fn execute_type_validator(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_802: Validate types against schema
-        Ok(ContractResult::Bool(true))
+    
+    fn free_descriptor_set(&self, set: vk::DescriptorSet) -> Result<(), String> {
+        unsafe {
+            self.device.free_descriptor_sets(self.descriptor_pool, &[set])
+        }.map_err(|e| format!("Free descriptor set failed: {:?}", e))
     }
-
-    fn execute_determinism_verifier(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_803: Verify determinism (1000x identical output)
-        Ok(ContractResult::Bool(true))
-    }
-
-    fn execute_contract_validator(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_805: Validate contract structure
-        Ok(ContractResult::Bool(true))
-    }
-
-    fn execute_error_handler(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_806: Handle and encode errors
-        Ok(ContractResult::Null)
-    }
-
-    // =========================================================================
-    // GPU Tier Contracts (900-902)
-    // =========================================================================
-
-    fn execute_vulkan_shader(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_900: Compile HLX to SPIR-V, execute on GPU
-        Ok(ContractResult::Null)
-    }
-
-    fn execute_compute_kernel(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_901: Define compute kernel
-        Ok(ContractResult::Null)
-    }
-
-    fn execute_pipeline_config(&self, _instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_902: Configure GPU pipeline
-        Ok(ContractResult::Null)
-    }
-
-    // =========================================================================
-    // Transformer Contracts (903-905) - GPU-Native
-    // =========================================================================
-
-    fn execute_transformer_forward(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_903: Full transformer forward pass
-        //
-        // Input:
-        //   input_tokens: [u32; seq_len]
-        //   model_handle: Handle
-        //   config: TransformerConfig
-        //
-        // Output:
-        //   logits: Tensor [seq_len, vocab_size]
-
-        // TODO: Wire up to actual forward pass in train_transformer_full.rs
-
-        // For now, return placeholder tensor
-        let seq_len = self.get_int_param(instr, "seq_len").unwrap_or(16) as usize;
-        let vocab_size = self.get_int_param(instr, "vocab_size").unwrap_or(256) as usize;
-
-        Ok(ContractResult::Tensor {
-            data: vec![0.0f32; seq_len * vocab_size],
-            shape: vec![seq_len, vocab_size],
-        })
-    }
-
-    fn execute_transformer_backward(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_904: Full transformer backward pass
-        //
-        // Input:
-        //   logits_grad: Tensor [seq_len, vocab_size]
-        //   activations_handle: Handle (from forward pass)
-        //   model_handle: Handle
-        //
-        // Output:
-        //   weight_grads_handle: Handle
-
-        // TODO: Wire up to actual backward pass
-
-        Ok(ContractResult::Handle([0u8; 32]))
-    }
-
-    fn execute_adam_optimizer(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_905: Adam optimizer step
-        //
-        // Input:
-        //   model_handle: Handle
-        //   weight_grads_handle: Handle
-        //   optimizer_state_handle: Handle
-        //   learning_rate: f64
-        //   beta1, beta2, epsilon: f64
-        //   step: i64
-        //
-        // Output:
-        //   updated_model_handle: Handle
-
-        let lr = self.get_float_param(instr, "learning_rate").unwrap_or(3e-4);
-        let step = self.get_int_param(instr, "step").unwrap_or(0);
-
-        // TODO: Wire up to actual Adam implementation
-
-        Ok(ContractResult::Handle([0u8; 32]))
-    }
-
-    // =========================================================================
-    // Tensor Contracts (906-910) - GPU-Native
-    // =========================================================================
-
-    fn execute_tensor_gemm(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_906: GPU Matrix Multiply (VALIDATED BIT-PERFECT)
-        //
-        // Input:
-        //   a: Tensor [M, K]
-        //   b: Tensor [K, N]
-        //   m, k, n: dimensions
-        //   transpose_a: bool
-        //   transpose_b: bool
-        //
-        // Output:
-        //   C: Tensor [M, N]
-
-        use super::contracts::tensor_ops;
-
-        // Get tensor data
-        let (a_data, _a_shape) = self.get_tensor_param(instr, "a")?;
-        let (b_data, _b_shape) = self.get_tensor_param(instr, "b")?;
-
-        // Get dimensions
-        let m = self.get_int_param(instr, "m")? as usize;
-        let k = self.get_int_param(instr, "k")? as usize;
-        let n = self.get_int_param(instr, "n")? as usize;
-
-        // Get transpose flags
-        let transpose_a = self.get_bool_param(instr, "transpose_a").unwrap_or(false);
-        let transpose_b = self.get_bool_param(instr, "transpose_b").unwrap_or(false);
-
-        // Execute GEMM
-        let result = tensor_ops::gemm(&a_data, &b_data, m, k, n, transpose_a, transpose_b)
-            .map_err(|e| LCBError::ExecutionFailed(e))?;
-
-        Ok(ContractResult::Tensor {
-            data: result,
-            shape: vec![m, n],
-        })
-    }
-
-    fn execute_tensor_layernorm(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_907: GPU Layer Normalization
-        //
-        // Input:
-        //   input: Tensor [batch, seq_len, hidden]
-        //   gamma: Tensor [hidden]
-        //   beta: Tensor [hidden]
-        //   eps: f64
-        //
-        // Output:
-        //   output: Tensor [batch, seq_len, hidden]
-
-        // TODO: Wire up to layernorm shader
-
-        Ok(ContractResult::Null)
-    }
-
-    fn execute_tensor_gelu(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_908: GPU GELU Activation
-        //
-        // Input:
-        //   input: Tensor [...]
-        //
-        // Output:
-        //   output: Tensor [...] (same shape)
-
-        use super::contracts::tensor_ops;
-
-        let (input_data, input_shape) = self.get_tensor_param(instr, "input")?;
-        let result = tensor_ops::gelu(&input_data);
-
-        Ok(ContractResult::Tensor {
-            data: result,
-            shape: input_shape,
-        })
-    }
-
-    fn execute_tensor_softmax(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_909: GPU Softmax
-        //
-        // Input:
-        //   input: Tensor [batch, seq_len, vocab]
-        //   num_rows, row_size: dimensions
-        //
-        // Output:
-        //   output: Tensor [batch, seq_len, vocab]
-
-        use super::contracts::tensor_ops;
-
-        let (input_data, input_shape) = self.get_tensor_param(instr, "input")?;
-        let num_rows = self.get_int_param(instr, "num_rows")? as usize;
-        let row_size = self.get_int_param(instr, "row_size")? as usize;
-
-        let result = tensor_ops::softmax(&input_data, num_rows, row_size);
-
-        Ok(ContractResult::Tensor {
-            data: result,
-            shape: input_shape,
-        })
-    }
-
-    fn execute_tensor_cross_entropy(&self, instr: &Instruction) -> Result<ContractResult, LCBError> {
-        // CONTRACT_910: GPU Cross-Entropy Loss
-        //
-        // Input:
-        //   logits: Tensor [batch, seq_len, vocab]
-        //   targets: Tensor [batch, seq_len]
-        //
-        // Output:
-        //   loss: Float
-        //   grad: Tensor [batch, seq_len, vocab]
-
-        // TODO: Wire up to cross_entropy shader
-
-        Ok(ContractResult::Float(0.0))
-    }
-
-    // =========================================================================
-    // Helper Methods
-    // =========================================================================
-
-    fn get_text_param(&self, instr: &Instruction, name: &str) -> Result<String, LCBError> {
-        match instr.params.get(name) {
-            Some(Param::Text(s)) => Ok(s.clone()),
-            Some(_) => Err(LCBError::InvalidParam {
-                name: name.to_string(),
-                expected: "text".to_string(),
-            }),
-            None => Err(LCBError::MissingParam(name.to_string())),
+    
+    fn update_descriptor_set(&self, set: vk::DescriptorSet, buffers: &[(u32, vk::Buffer, u64)]) {
+        let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers.iter()
+            .map(|(_, buf, size)| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(*buf)
+                    .offset(0)
+                    .range(*size)
+            })
+            .collect();
+        
+        let writes: Vec<vk::WriteDescriptorSet> = buffers.iter()
+            .zip(buffer_infos.iter())
+            .map(|((binding, _, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        
+        unsafe {
+            self.device.update_descriptor_sets(&writes, &[]);
         }
     }
-
-    fn get_int_param(&self, instr: &Instruction, name: &str) -> Result<i64, LCBError> {
-        match instr.params.get(name) {
-            Some(Param::Int(i)) => Ok(*i),
-            Some(_) => Err(LCBError::InvalidParam {
-                name: name.to_string(),
-                expected: "int".to_string(),
-            }),
-            None => Err(LCBError::MissingParam(name.to_string())),
+    
+    fn execute_pipeline<T>(
+        &mut self,
+        pipeline: vk::Pipeline,
+        descriptor_set: vk::DescriptorSet,
+        push_constants: &T,
+        groups_x: u32,
+        groups_y: u32,
+        groups_z: u32,
+    ) -> Result<(), String> {
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        
+        unsafe {
+            self.device.begin_command_buffer(self.command_buffer, &begin_info)
+                .map_err(|e| format!("Begin command buffer failed: {:?}", e))?;
+            
+            self.device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            
+            let push_bytes = std::slice::from_raw_parts(
+                push_constants as *const T as *const u8,
+                std::mem::size_of::<T>(),
+            );
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+            
+            self.device.cmd_dispatch(self.command_buffer, groups_x, groups_y, groups_z);
+            
+            self.device.end_command_buffer(self.command_buffer)
+                .map_err(|e| format!("End command buffer failed: {:?}", e))?;
+            
+            let submit_info = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            
+            self.device.queue_submit(self.compute_queue, &[submit_info], self.fence)
+                .map_err(|e| format!("Queue submit failed: {:?}", e))?;
+            
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| format!("Wait for fences failed: {:?}", e))?;
+            
+            self.device.reset_fences(&[self.fence])
+                .map_err(|e| format!("Reset fences failed: {:?}", e))?;
+            
+            self.device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("Reset command buffer failed: {:?}", e))?;
         }
-    }
-
-    fn get_float_param(&self, instr: &Instruction, name: &str) -> Result<f64, LCBError> {
-        match instr.params.get(name) {
-            Some(Param::Float(f)) => Ok(*f),
-            Some(Param::Int(i)) => Ok(*i as f64),
-            Some(_) => Err(LCBError::InvalidParam {
-                name: name.to_string(),
-                expected: "float".to_string(),
-            }),
-            None => Err(LCBError::MissingParam(name.to_string())),
-        }
-    }
-
-    fn get_bool_param(&self, instr: &Instruction, name: &str) -> Result<bool, LCBError> {
-        match instr.params.get(name) {
-            Some(Param::Bool(b)) => Ok(*b),
-            Some(_) => Err(LCBError::InvalidParam {
-                name: name.to_string(),
-                expected: "bool".to_string(),
-            }),
-            None => Err(LCBError::MissingParam(name.to_string())),
-        }
-    }
-
-    /// Extract tensor from Bytes param (format: [ndim:u8][dims:u32...][f32 data])
-    fn get_tensor_param(&self, instr: &Instruction, name: &str) -> Result<(Vec<f32>, Vec<usize>), LCBError> {
-        match instr.params.get(name) {
-            Some(Param::Bytes(bytes)) => {
-                if bytes.is_empty() {
-                    return Err(LCBError::InvalidParam {
-                        name: name.to_string(),
-                        expected: "tensor bytes".to_string(),
-                    });
-                }
-
-                let ndim = bytes[0] as usize;
-                let mut offset = 1;
-
-                // Read shape
-                let mut shape = Vec::with_capacity(ndim);
-                let mut total_elements = 1usize;
-                for _ in 0..ndim {
-                    if offset + 4 > bytes.len() {
-                        return Err(LCBError::InvalidParam {
-                            name: name.to_string(),
-                            expected: "complete shape".to_string(),
-                        });
-                    }
-                    let dim = u32::from_le_bytes([
-                        bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]
-                    ]) as usize;
-                    shape.push(dim);
-                    total_elements *= dim;
-                    offset += 4;
-                }
-
-                // Read f32 data
-                let expected_bytes = total_elements * 4;
-                if offset + expected_bytes > bytes.len() {
-                    return Err(LCBError::InvalidParam {
-                        name: name.to_string(),
-                        expected: format!("{} bytes of tensor data", expected_bytes),
-                    });
-                }
-
-                let data: Vec<f32> = bytes[offset..offset + expected_bytes]
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-
-                Ok((data, shape))
-            }
-            Some(_) => Err(LCBError::InvalidParam {
-                name: name.to_string(),
-                expected: "bytes (tensor)".to_string(),
-            }),
-            None => Err(LCBError::MissingParam(name.to_string())),
-        }
-    }
-
-    /// Get execution statistics
-    pub fn stats(&self) -> &ExecutionStats {
-        &self.stats
+        
+        Ok(())
     }
 }
 
-impl Default for LCBExecutor {
-    fn default() -> Self {
-        Self::new()
+impl Drop for LCBExecutor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            
+            self.device.destroy_pipeline(self.gemm_pipeline, None);
+            self.device.destroy_pipeline(self.layernorm_pipeline, None);
+            self.device.destroy_pipeline(self.gelu_pipeline, None);
+            self.device.destroy_pipeline(self.softmax_pipeline, None);
+            self.device.destroy_pipeline(self.cross_entropy_pipeline, None);
+            
+            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lcb::parser::LCBBuilder;
-
+    
     #[test]
-    fn test_executor_dispatch() {
-        let mut params = HashMap::new();
-        params.insert("mode".to_string(), Param::Text("validate".to_string()));
-
-        let batch_bytes = LCBBuilder::new()
-            .add_instruction(BINARY_SERIALIZER, params)
-            .build();
-
-        let batch = super::super::parser::parse_batch(&batch_bytes).unwrap();
-        let mut executor = LCBExecutor::new();
-        let results = executor.execute_batch(&batch).unwrap();
-
-        assert_eq!(results.len(), 1);
-        match &results[0] {
-            ContractResult::Bool(true) => {}
-            other => panic!("Expected Bool(true), got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_tensor_gemm_contract() {
-        // Create tensor bytes: [ndim:u8][dims:u32...][f32 data]
-        fn make_tensor_bytes(shape: &[usize], data: &[f32]) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            bytes.push(shape.len() as u8);
-            for &dim in shape {
-                bytes.extend_from_slice(&(dim as u32).to_le_bytes());
-            }
-            for &val in data {
-                bytes.extend_from_slice(&val.to_le_bytes());
-            }
-            bytes
-        }
-
-        // 2x2 GEMM: [[1,2],[3,4]] @ [[5,6],[7,8]] = [[19,22],[43,50]]
-        let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
-        let b_data = vec![5.0f32, 6.0, 7.0, 8.0];
-
-        let mut params = HashMap::new();
-        params.insert("a".to_string(), Param::Bytes(make_tensor_bytes(&[2, 2], &a_data)));
-        params.insert("b".to_string(), Param::Bytes(make_tensor_bytes(&[2, 2], &b_data)));
-        params.insert("m".to_string(), Param::Int(2));
-        params.insert("k".to_string(), Param::Int(2));
-        params.insert("n".to_string(), Param::Int(2));
-        params.insert("transpose_a".to_string(), Param::Bool(false));
-        params.insert("transpose_b".to_string(), Param::Bool(false));
-
-        let batch_bytes = LCBBuilder::new()
-            .add_instruction(TENSOR_GEMM, params)
-            .build();
-
-        let batch = super::super::parser::parse_batch(&batch_bytes).unwrap();
-        let mut executor = LCBExecutor::new();
-        let results = executor.execute_batch(&batch).unwrap();
-
-        match &results[0] {
-            ContractResult::Tensor { data, shape } => {
-                assert_eq!(shape, &vec![2, 2]);
-                assert_eq!(data.len(), 4);
-                // Check values: [[19,22],[43,50]]
-                assert!((data[0] - 19.0).abs() < 1e-6);
-                assert!((data[1] - 22.0).abs() < 1e-6);
-                assert!((data[2] - 43.0).abs() < 1e-6);
-                assert!((data[3] - 50.0).abs() < 1e-6);
-            }
-            other => panic!("Expected Tensor, got {:?}", other),
-        }
+    fn test_tensor_data_from_f32() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let tensor = TensorData::from_f32(&data, vec![2, 2]);
+        assert_eq!(tensor.shape, vec![2, 2]);
+        assert_eq!(tensor.as_f32().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
     }
 }
