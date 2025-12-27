@@ -615,5 +615,5 @@ On error, execution stops and error is returned to caller.
 ---
 
 **Version:** 1.1.0
-**Status:** Production-ready
+**Status:** Ready for outside validation
 **Testing:** 100+ test cases passing
