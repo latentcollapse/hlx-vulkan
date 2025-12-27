@@ -273,7 +273,6 @@ HLX builds on proven standards:
 ### Related Documents
 
 - [../README.md](../README.md) - Project overview
-- [../README_AMD.md](../README_AMD.md) - AMD technical brief
 - [../QUICKSTART.md](../QUICKSTART.md) - Installation & quick start
 - [../benchmarks/BENCHMARK_RESULTS.md](../benchmarks/BENCHMARK_RESULTS.md) - Performance data
 
@@ -306,6 +305,5 @@ This documentation is part of HLX, released under the **Apache 2.0 License**.
 ## Quick Links
 
 - **Homepage:** https://github.com/latentcollapse/hlx-compiler
-- **Runtimes:** https://github.com/latentcollapse/HLXv1.1.0
 - **IDE/Studio:** https://github.com/latentcollapse/hlx-studio
 - **Issues:** https://github.com/latentcollapse/hlx-compiler/issues
